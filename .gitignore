@@ -1,0 +1,7 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+secrets.env
+.DS_Store
+*.swp

@@ -1,0 +1,9 @@
+ccxt
+aiohttp
+websockets
+pandas
+numpy
+python-dotenv
+uvloop
+aioredis
+openpyxl
