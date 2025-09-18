@@ -1,0 +1,5 @@
+exchanges:
+  independentreserve:
+    pairs: ["BTC/AUD", "ETH/AUD"]
+reporting:
+  csv_path: "/opt/aud_arb/out/ir_boa.csv"
