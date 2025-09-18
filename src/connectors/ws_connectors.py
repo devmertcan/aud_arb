@@ -8,7 +8,7 @@ async def ws_listen(url, subscribe_message, on_msg):
             await on_msg(data)
 
 async def subscribe_ir_orderbook(symbol: str, callback):
-    url = "wss://api.independentreserve.com/WebSocket"
+    url = "wss://websockets.independentreserve.com/"
     subscribe_message = {
         "type": "subscribe",
         "channel": f"orderbook-{symbol.replace('/', '').lower()}"
