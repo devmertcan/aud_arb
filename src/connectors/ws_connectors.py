@@ -13,7 +13,7 @@ async def ws_listen(url, subscribe_message, on_msg):
             await on_msg(data)
 
 async def subscribe_ir_orderbook(symbol: str, callback):
-    url = "wss://api.independentreserve.com/WebSocket"
+    url = "wss://websockets.independentreserve.com"
 
     # This subscribe_message is just a placeholder until we see what IR expects
     subscribe_message = {
