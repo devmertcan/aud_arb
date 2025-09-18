@@ -1,9 +1,10 @@
 import asyncio
-from connectors.ws_connectors import subscribe_ir_orderbook
+from connectors.ccxt_rest import CCXTRestConnector
 
-async def main():
-    async def print_ob(data):
-        print("Orderbook update:", data)
-    await subscribe_ir_orderbook("BTC/AUD", print_ob)
+async def test():
+    rest = CCXTRestConnector("independentreserve")
+    ob = await rest.get_orderbook_rest("BTC/AUD")
+    print("REST snapshot:", ob["bids"][:1], ob["asks"][:1])
+    await rest.close()
 
-asyncio.run(main())
+asyncio.run(test())
