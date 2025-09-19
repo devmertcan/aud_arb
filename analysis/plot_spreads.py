@@ -2,7 +2,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 df = pd.read_csv("/opt/aud_arb/out/tob_snapshots.csv")
-df["timestamp_iso"] = pd.to_datetime(df["timestamp_iso"])
+df["timestamp_iso"] = pd.to_datetime(df["timestamp_iso"], format="mixed", utc=True, errors="coerce")
 
 ir = df[df["exchange"] == "independentreserve"].set_index("timestamp_iso")
 kraken = df[df["exchange"] == "kraken"].set_index("timestamp_iso")
