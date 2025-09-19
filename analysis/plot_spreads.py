@@ -7,20 +7,29 @@ from itertools import combinations
 csv_path = "/opt/aud_arb/out/tob_snapshots.csv"
 df = pd.read_csv(csv_path)
 
-# Parse timestamps (mixed ISO formats, UTC)
-df["timestamp_iso"] = pd.to_datetime(df["timestamp_iso"], format="mixed", utc=True, errors="coerce")
+# Parse timestamps (handles mixed ISO formats, UTC)
+df["timestamp_iso"] = pd.to_datetime(
+    df["timestamp_iso"], format="mixed", utc=True, errors="coerce"
+)
 df = df.dropna(subset=["timestamp_iso"])
 
 # Group by exchange
-dfs = {
-    ex: g.drop_duplicates(subset=["timestamp_iso"]).set_index("timestamp_iso").resample("10s").first()
-    for ex, g in df.groupby("exchange")
-}
+dfs = {ex: g.drop_duplicates(subset=["timestamp_iso"]).set_index("timestamp_iso")
+       for ex, g in df.groupby("exchange")}
+
+# Resample and forward-fill to align timestamps
+resample_window = "30s"   # change to "10s", "30s", or "1min"
+for ex in dfs:
+    dfs[ex] = dfs[ex].resample(resample_window).ffill()
 
 # ---------- Cross-Exchange Analysis ----------
 pair_stats = []
 for (ex_a, df_a), (ex_b, df_b) in combinations(dfs.items(), 2):
     merged = pd.concat({ex_a: df_a, ex_b: df_b}, axis=1).dropna()
+    print(f"[DEBUG] {ex_a} vs {ex_b}: merged rows = {len(merged)}")
+
+    if merged.empty:
+        continue
 
     # Spread in both directions
     merged["spread_ab"] = merged[(ex_a, "best_bid_price")] - merged[(ex_b, "best_ask_price")]
@@ -52,7 +61,7 @@ for (ex_a, df_a), (ex_b, df_b) in combinations(dfs.items(), 2):
         "success_rate_min": rate_ba.min(),
         "success_rate_max": rate_ba.max(),
         "success_rate_std": rate_ba.std(),
-        "samples": len(rate_ba.dropna())
+        "samples": len(rate_b.dropna())
     })
 
     # --- Plot one example spread for visual check ---
@@ -73,20 +82,24 @@ print(f"[INFO] Saved pair success rates to {pair_csv}")
 print(pair_df.head())
 
 # ---------- Heatmap with Samples ----------
-heatmap_df = pair_df.copy()
-heatmap_df["sell"] = heatmap_df["pair"].apply(lambda x: x.split(" sell vs ")[0])
-heatmap_df["buy"] = heatmap_df["pair"].apply(lambda x: x.split(" sell vs ")[1].replace(" buy",""))
+if not pair_df.empty:
+    heatmap_df = pair_df.copy()
+    heatmap_df["sell"] = heatmap_df["pair"].apply(lambda x: x.split(" sell vs ")[0])
+    heatmap_df["buy"] = heatmap_df["pair"].apply(lambda x: x.split(" sell vs ")[1].replace(" buy",""))
 
-matrix_rate = heatmap_df.pivot(index="sell", columns="buy", values="success_rate_mean")
-matrix_samples = heatmap_df.pivot(index="sell", columns="buy", values="samples")
+    matrix_rate = heatmap_df.pivot(index="sell", columns="buy", values="success_rate_mean")
+    matrix_samples = heatmap_df.pivot(index="sell", columns="buy", values="samples")
 
-# Annotation: "rate% (samples)"
-annot = matrix_rate.round(1).astype(str) + "% (" + matrix_samples.fillna(0).astype(int).astype(str) + ")"
+    # Annotation: "rate% (samples)"
+    annot = matrix_rate.round(1).astype(str) + "% (" + matrix_samples.fillna(0).astype(int).astype(str) + ")"
 
-plt.figure(figsize=(9,7))
-sns.heatmap(matrix_rate, annot=annot, fmt="", cmap="YlGnBu", cbar_kws={'label': 'Success Rate (%)'})
-plt.title("Cross-Exchange Arbitrage Success Rates (with sample counts)")
-plt.ylabel("Sell Exchange")
-plt.xlabel("Buy Exchange")
-plt.tight_layout()
-plt.show()
+    plt.figure(figsize=(9,7))
+    sns.heatmap(matrix_rate, annot=annot, fmt="", cmap="YlGnBu",
+                cbar_kws={'label': 'Success Rate (%)'})
+    plt.title("Cross-Exchange Arbitrage Success Rates (with sample counts)")
+    plt.ylabel("Sell Exchange")
+    plt.xlabel("Buy Exchange")
+    plt.tight_layout()
+    plt.show()
+else:
+    print("[WARN] No overlapping data found between exchanges after resampling.")
