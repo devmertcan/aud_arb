@@ -34,9 +34,21 @@ def test_orderbook_manager():
     ob.apply_snapshot([(100, 1)], [(101, 1)])
     bid = ob.best_bid()
     ask = ob.best_ask()
-    assert bid is not None and ask is not None, "Orderbook did not update correctly"
-    assert bid <= 100.0 and ask >= 101.0, "Best bid/ask values not as expected"
+
+    # Unpack if tuple (price, size)
+    if isinstance(bid, tuple):
+        bid_price = bid[0]
+    else:
+        bid_price = bid
+    if isinstance(ask, tuple):
+        ask_price = ask[0]
+    else:
+        ask_price = ask
+
+    assert bid_price is not None and ask_price is not None, "Orderbook did not update correctly"
+    assert bid_price <= 100.0 and ask_price >= 101.0, "Best bid/ask values not as expected"
     print(f"✅ Step 5: Orderbook Manager working (bid={bid}, ask={ask})")
+
 
 def test_detector():
     print("=== Step 6: Testing Arbitrage Detector ===")
