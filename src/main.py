@@ -1,77 +1,68 @@
 import asyncio
-import os
-
-try:
-    import uvloop
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-except Exception:
-    pass
-
+import uvloop
 from connectors.ccxt_rest import CCXTRestConnector
 from connectors.ws_connectors import subscribe_ir_orderbook
+from orderbook.orderbook_manager import Orderbook
 from detector.arb_detector import ArbitrageDetector
-from reporter.csv_reporter import CSVReporter, TOBReporter
+from reporter.csv_reporter import TOBReporter
 
 
-PAIR = os.environ.get("PAIR", "BTC/AUD")
-CSV_PATH = os.environ.get("CSV_PATH", "/opt/aud_arb/out/arb_opps.csv")
-TOB_PATH = os.environ.get("TOB_PATH", "/opt/aud_arb/out/tob_snapshots.csv")
+PAIR = "BTC/AUD"
+rest = CCXTRestConnector("kraken")
+tob_reporter = TOBReporter()
 
 
 async def fetch_kraken_snapshot(symbol: str):
-    rest = CCXTRestConnector("kraken")
     ob = await rest.get_orderbook_rest(symbol)
-    await rest.close()
     return ob
 
 
 async def run_detector():
-    detector = ArbitrageDetector(min_profit_pct=0.7, fees_pct=0.2)
-    reporter = CSVReporter(CSV_PATH)
-    tob_reporter = TOBReporter(TOB_PATH)
+    orderbooks = {
+        "independentreserve": Orderbook(),
+        "kraken": Orderbook(),
+    }
+    detector = ArbitrageDetector(orderbooks, threshold=0.007)
 
-    latest_ir = {"bids": [], "asks": []}
-    latest_kraken = {"bids": [], "asks": []}
-
-    async def on_ir_update(ob):
-        nonlocal latest_ir, latest_kraken
-        latest_ir = ob
-        bids, asks = ob.get("bids", []), ob.get("asks", [])
-        if bids and asks:
-            tob_reporter.write_tob("independentreserve", PAIR, bids[0], asks[0], ob.get("timestamp"))
-        if latest_kraken["bids"] and latest_kraken["asks"]:
-            opp = detector.check_opportunity(latest_ir, latest_kraken,
-                                             "independentreserve", "kraken", PAIR)
-            if opp:
-                print("ARB OPPORTUNITY:", opp)
-                reporter.write_top_of_book(
-                    "arb", PAIR,
-                    [(opp["buy_price"], 1)], [(opp["sell_price"], 1)],
-                    int(opp["timestamp"] * 1000),
-                    notes=f"{opp['buy_exchange']} -> {opp['sell_exchange']} spread {opp['net_pct']}%"
-                )
-
-    # Kick off Kraken snapshot updater (REST every 10s for demo)
-    async def kraken_updater():
-        nonlocal latest_kraken
-        while True:
-            latest_kraken = await fetch_kraken_snapshot(PAIR)
-            bids, asks = latest_kraken.get("bids", []), latest_kraken.get("asks", [])
+    async def ir_updater():
+        async def on_ob(ob):
+            bids, asks = ob.get("bids", []), ob.get("asks", [])
             if bids and asks:
-                print(f"[KRAKEN SNAPSHOT] bid {bids[0]} | ask {asks[0]}")
-                # ADD THIS LINE:
+                best_bid = bids[0]
+                best_ask = asks[0]
+                orderbooks["independentreserve"].apply_snapshot(bids, asks)
                 tob_reporter.write_tob(
-                    "kraken", PAIR,
-                    bids[0][0], bids[0][1],
-                    asks[0][0], asks[0][1],
-                    timestamp=latest_kraken.get("timestamp")
+                    "independentreserve",
+                    PAIR,
+                    best_bid[0], best_bid[1],
+                    best_ask[0], best_ask[1],
+                    timestamp=ob.get("timestamp"),
+                )
+        await subscribe_ir_orderbook(PAIR, on_ob)
+
+    async def kraken_updater():
+        while True:
+            ob = await fetch_kraken_snapshot(PAIR)
+            bids, asks = ob.get("bids", []), ob.get("asks", [])
+            if bids and asks:
+                best_bid = bids[0]
+                best_ask = asks[0]
+                orderbooks["kraken"].apply_snapshot(bids, asks)
+                tob_reporter.write_tob(
+                    "kraken",
+                    PAIR,
+                    best_bid[0], best_bid[1],
+                    best_ask[0], best_ask[1],
+                    timestamp=ob.get("timestamp"),
                 )
             await asyncio.sleep(10)
 
-    await asyncio.gather(
-        subscribe_ir_orderbook(PAIR, on_ir_update),
-        kraken_updater()
-    )
+    async def detector_loop():
+        while True:
+            detector.check_opportunity()
+            await asyncio.sleep(5)
+
+    await asyncio.gather(ir_updater(), kraken_updater(), detector_loop())
 
 
 async def main():
@@ -79,4 +70,5 @@ async def main():
 
 
 if __name__ == "__main__":
+    uvloop.install()
     asyncio.run(main())
