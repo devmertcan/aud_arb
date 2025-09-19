@@ -20,13 +20,36 @@ async def demo_run(duration=120):
     detector = ArbitrageDetector(orderbooks, threshold=0.007)
 
     async def ir_updater():
+        # 1. Seed with REST snapshot (so CSV has initial IR data)
+        rest_ir = CCXTRestConnector("independentreserve")
+        snapshot = await rest_ir.get_orderbook_rest(PAIR)
+        bids, asks = snapshot.get("bids", []), snapshot.get("asks", [])
+        if bids and asks:
+            best_bid, best_ask = bids[0], asks[0]
+            orderbooks["independentreserve"].apply_snapshot(bids, asks)
+            tob_reporter.write_tob(
+                "independentreserve", PAIR,
+                best_bid[0], best_bid[1],
+                best_ask[0], best_ask[1],
+                timestamp=snapshot.get("timestamp"),
+            )
+            print(f"[{now()}] [IR REST SNAPSHOT] bid {best_bid} | ask {best_ask}")
+        await rest_ir.close()
+
+        # 2. WebSocket live updates
         async def on_ob(ob):
             bids, asks = ob.get("bids", []), ob.get("asks", [])
             if bids and asks:
                 best_bid, best_ask = bids[0], asks[0]
                 orderbooks["independentreserve"].apply_snapshot(bids, asks)
-                tob_reporter.write_tob("independentreserve", PAIR, best_bid[0], best_bid[1], best_ask[0], best_ask[1])
-                print(f"[{now()}] [IR WS] bid {best_bid} | ask {best_ask}")
+                tob_reporter.write_tob(
+                    "independentreserve", PAIR,
+                    best_bid[0], best_bid[1],
+                    best_ask[0], best_ask[1],
+                    timestamp=ob.get("timestamp"),
+                )
+                print(f"[{now()}] [IR WS UPDATE] bid {best_bid} | ask {best_ask}")
+
         await subscribe_ir_orderbook(PAIR, on_ob)
 
     async def kraken_updater():
