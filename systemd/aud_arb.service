@@ -1,17 +1,14 @@
 [Unit]
-Description=AUD Arbitrage Detector (Milestone 1 - detection only)
+Description=AUD Arbitrage Bot
 After=network.target
 
 [Service]
-User=mertcan
 WorkingDirectory=/opt/aud_arb
-Environment="PAIR=BTC/AUD"
-Environment="CSV_PATH=/opt/aud_arb/out/ir_boa.csv"
-ExecStart=/opt/aud_arb/.venv/bin/python /opt/aud_arb/src/main.py
+ExecStart=/opt/aud_arb/.venv/bin/python -u src/main.py
 Restart=always
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
+User=root
+StandardOutput=append:/opt/aud_arb/logs/bot.log
+StandardError=append:/opt/aud_arb/logs/bot.log
 
 [Install]
 WantedBy=multi-user.target
