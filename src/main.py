@@ -13,8 +13,7 @@ tob_reporter = TOBReporter()
 
 
 async def fetch_kraken_snapshot(symbol: str):
-    ob = await rest.get_orderbook_rest(symbol)
-    return ob
+    return await rest.get_orderbook_rest(symbol)
 
 
 async def run_detector():
@@ -32,8 +31,7 @@ async def run_detector():
                 best_ask = asks[0]
                 orderbooks["independentreserve"].apply_snapshot(bids, asks)
                 tob_reporter.write_tob(
-                    "independentreserve",
-                    PAIR,
+                    "independentreserve", PAIR,
                     best_bid[0], best_bid[1],
                     best_ask[0], best_ask[1],
                     timestamp=ob.get("timestamp"),
@@ -49,12 +47,12 @@ async def run_detector():
                 best_ask = asks[0]
                 orderbooks["kraken"].apply_snapshot(bids, asks)
                 tob_reporter.write_tob(
-                    "kraken",
-                    PAIR,
+                    "kraken", PAIR,
                     best_bid[0], best_bid[1],
                     best_ask[0], best_ask[1],
                     timestamp=ob.get("timestamp"),
                 )
+                print(f"[KRAKEN SNAPSHOT] bid {best_bid} | ask {best_ask}")
             await asyncio.sleep(10)
 
     async def detector_loop():
