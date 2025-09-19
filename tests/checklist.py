@@ -35,32 +35,30 @@ def test_orderbook_manager():
     bid = ob.best_bid()
     ask = ob.best_ask()
 
-    # Unpack if tuple (price, size)
-    if isinstance(bid, tuple):
-        bid_price = bid[0]
-    else:
-        bid_price = bid
-    if isinstance(ask, tuple):
-        ask_price = ask[0]
-    else:
-        ask_price = ask
+    # Handle both tuple (price, size) and float
+    bid_price = bid[0] if isinstance(bid, tuple) else bid
+    ask_price = ask[0] if isinstance(ask, tuple) else ask
 
     assert bid_price is not None and ask_price is not None, "Orderbook did not update correctly"
     assert bid_price <= 100.0 and ask_price >= 101.0, "Best bid/ask values not as expected"
     print(f"✅ Step 5: Orderbook Manager working (bid={bid}, ask={ask})")
 
-
 def test_detector():
     print("=== Step 6: Testing Arbitrage Detector ===")
     ob_a = Orderbook(); ob_b = Orderbook()
-    ob_a.apply_snapshot([(100, 1)], [(102, 1)])
-    ob_b.apply_snapshot([(105, 1)], [(107, 1)])
-    detector = ArbitrageDetector({"A": ob_a, "B": ob_b}, threshold=0.01)
+
+    # Force a clear arbitrage: buy at 90, sell at 110 (spread 20)
+    ob_a.apply_snapshot([(89, 1)], [(90, 1)])   # Exchange A
+    ob_b.apply_snapshot([(110, 1)], [(111, 1)]) # Exchange B
+
+    detector = ArbitrageDetector({"A": ob_a, "B": ob_b}, threshold=0.01)  # 1% threshold
+
     triggered = []
     detector.report_fn = triggered.append
     detector.check_opportunity()
+
     assert triggered, "Detector did not fire"
-    print("✅ Step 6: Arbitrage Detector working")
+    print("✅ Step 6: Arbitrage Detector working →", triggered[0])
 
 def test_reporter():
     print("=== Step 7: Testing Reporter ===")
