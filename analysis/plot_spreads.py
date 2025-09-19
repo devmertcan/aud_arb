@@ -28,7 +28,7 @@ threshold = 0.007 * merged[("kraken", "best_ask_price")].mean()
 merged["success"] = merged["spread_cross"] > threshold
 
 # Rolling hourly success rate
-rolling_rate = merged["success"].resample("1H").mean() * 100
+rolling_rate = merged["success"].resample("1h").mean() * 100
 
 # --------- PLOTS ---------
 plt.figure(figsize=(12,6))
