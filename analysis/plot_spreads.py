@@ -30,6 +30,11 @@ merged["success"] = merged["spread_cross"] > threshold
 # Rolling hourly success rate
 rolling_rate = merged["success"].resample("1h").mean() * 100
 
+# --------- SAVE TO CSV ---------
+success_csv = "/opt/aud_arb/out/success_rate.csv"
+rolling_rate.to_csv(success_csv, header=["success_rate_pct"])
+print(f"[INFO] Saved success rate to {success_csv}")
+
 # --------- PLOTS ---------
 plt.figure(figsize=(12,6))
 plt.plot(merged.index, merged["spread_cross"], label="IR bid - Kraken ask")
