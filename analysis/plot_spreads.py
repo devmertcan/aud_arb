@@ -14,22 +14,37 @@ df["timestamp_iso"] = pd.to_datetime(
 df = df.dropna(subset=["timestamp_iso"])
 
 # Group by exchange
-dfs = {ex: g.drop_duplicates(subset=["timestamp_iso"]).set_index("timestamp_iso")
-       for ex, g in df.groupby("exchange")}
+dfs_raw = {
+    ex: g.drop_duplicates(subset=["timestamp_iso"]).set_index("timestamp_iso")
+    for ex, g in df.groupby("exchange")
+}
 
-# Resample and forward-fill to align timestamps
-resample_window = "30s"   # change to "10s", "30s", or "1min"
-for ex in dfs:
-    dfs[ex] = dfs[ex].resample(resample_window).ffill()
+# Candidate windows to try
+windows = ["10s", "30s", "1min"]
 
 # ---------- Cross-Exchange Analysis ----------
 pair_stats = []
-for (ex_a, df_a), (ex_b, df_b) in combinations(dfs.items(), 2):
-    merged = pd.concat({ex_a: df_a, ex_b: df_b}, axis=1).dropna()
-    print(f"[DEBUG] {ex_a} vs {ex_b}: merged rows = {len(merged)}")
+for (ex_a, raw_a), (ex_b, raw_b) in combinations(dfs_raw.items(), 2):
+    best_window = None
+    best_overlap = 0
+    best_merged = None
 
-    if merged.empty:
+    # Try each window
+    for win in windows:
+        df_a = raw_a.resample(win).ffill()
+        df_b = raw_b.resample(win).ffill()
+        merged = pd.concat({ex_a: df_a, ex_b: df_b}, axis=1).dropna()
+        if len(merged) > best_overlap:
+            best_overlap = len(merged)
+            best_window = win
+            best_merged = merged
+
+    print(f"[DEBUG] {ex_a} vs {ex_b}: best window={best_window}, rows={best_overlap}")
+
+    if best_merged is None or best_overlap == 0:
         continue
+
+    merged = best_merged
 
     # Spread in both directions
     merged["spread_ab"] = merged[(ex_a, "best_bid_price")] - merged[(ex_b, "best_ask_price")]
@@ -64,11 +79,11 @@ for (ex_a, df_a), (ex_b, df_b) in combinations(dfs.items(), 2):
         "samples": len(rate_b.dropna())
     })
 
-    # --- Plot one example spread for visual check ---
+    # --- Plot spread for visual check ---
     plt.figure(figsize=(12,6))
     plt.plot(merged.index, merged["spread_ab"], label=f"{ex_a} bid - {ex_b} ask")
     plt.axhline(threshold, color="red", linestyle="--", label="0.7% threshold")
-    plt.title(f"Cross-Exchange Spread: {ex_a} vs {ex_b}")
+    plt.title(f"Cross-Exchange Spread: {ex_a} vs {ex_b} (window={best_window})")
     plt.ylabel("Spread (AUD)")
     plt.legend()
     plt.tight_layout()
@@ -86,7 +101,7 @@ else:
     print(f"[INFO] Saved pair success rates to {pair_csv}")
     print(pair_df.head())
 
-    # Heatmap
+    # ---------- Heatmap with Samples ----------
     heatmap_df = pair_df.copy()
     heatmap_df["sell"] = heatmap_df["pair"].apply(lambda x: x.split(" sell vs ")[0])
     heatmap_df["buy"] = heatmap_df["pair"].apply(lambda x: x.split(" sell vs ")[1].replace(" buy",""))
@@ -94,10 +109,12 @@ else:
     matrix_rate = heatmap_df.pivot(index="sell", columns="buy", values="success_rate_mean")
     matrix_samples = heatmap_df.pivot(index="sell", columns="buy", values="samples")
 
-    annot = matrix_rate.round(1).astype(str) + "% (" + matrix_samples.fillna(0).astype(int).astype(str) + ")"
+    # Annotation: "rate% (samples)"
+    annot = (
+        matrix_rate.round(1).astype(str)
+        + "% (" + matrix_samples.fillna(0).astype(int).astype(str) + ")"
+    )
 
-    import seaborn as sns
-    import matplotlib.pyplot as plt
     plt.figure(figsize=(9,7))
     sns.heatmap(matrix_rate, annot=annot, fmt="", cmap="YlGnBu",
                 cbar_kws={'label': 'Success Rate (%)'})
@@ -106,4 +123,3 @@ else:
     plt.xlabel("Buy Exchange")
     plt.tight_layout()
     plt.show()
-
