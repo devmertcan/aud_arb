@@ -19,14 +19,10 @@ async def test_ir_ws():
 
     async def on_ob(ob):
         bids, asks = ob.get("bids", []), ob.get("asks", [])
-        if bids and asks:
+        if bids or asks:
             print("IR WS update:", bids[:1], asks[:1])
-            raise SystemExit  # exit after first valid update
 
-    try:
-        await subscribe_ir_orderbook(PAIR, on_ob)
-    except SystemExit:
-        pass
+    await asyncio.wait_for(subscribe_ir_orderbook(PAIR, on_ob), timeout=60)
 
 
 async def main():
