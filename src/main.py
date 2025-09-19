@@ -58,8 +58,11 @@ async def run_detector():
             latest_kraken = await fetch_kraken_snapshot(PAIR)
             bids, asks = latest_kraken.get("bids", []), latest_kraken.get("asks", [])
             if bids and asks:
-                print(f"[KRAKEN SNAPSHOT] bid {bids[0]} | ask {asks[0]} | spread {asks[0][0]-bids[0][0]:.2f}")
-                tob_reporter.write_tob("kraken", PAIR, bids[0], asks[0], latest_kraken.get("timestamp"))
+                print(f"[KRAKEN SNAPSHOT] bid {bids[0]} | ask {asks[0]}")
+                # ADD THIS LINE:
+                tob_reporter.write_tob(
+                    "kraken", PAIR, bids[0][0], bids[0][1], asks[0][0], asks[0][1], latest_kraken.get("timestamp")
+                )
             await asyncio.sleep(10)
 
     await asyncio.gather(
