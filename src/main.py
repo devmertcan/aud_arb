@@ -7,8 +7,9 @@ from connectors.ws_connectors import subscribe_ir_orderbook
 from orderbook.orderbook_manager import Orderbook
 from detector.arb_detector import ArbitrageDetector
 from reporter.csv_reporter import TOBReporter
+from utils.logging_config import setup_logger
 
-
+logger = setup_logger()
 PAIR = "BTC/AUD"
 rest = CCXTRestConnector("kraken")
 tob_reporter = TOBReporter()
@@ -40,7 +41,7 @@ async def run_detector():
                 best_ask[0], best_ask[1],
                 timestamp=snapshot.get("timestamp"),
             )
-            print(f"[{now()}] [IR REST SNAPSHOT] bid {best_bid} | ask {best_ask}")
+            logger.info(f"[IR REST SNAPSHOT] bid {best_bid} | ask {best_ask}")
         await rest_ir.close()
 
         # 2. WebSocket live updates
@@ -55,7 +56,7 @@ async def run_detector():
                     best_ask[0], best_ask[1],
                     timestamp=ob.get("timestamp"),
                 )
-                print(f"[{now()}] [IR WS UPDATE] bid {best_bid} | ask {best_ask}")
+                logger.info(f"[IR WS UPDATE] bid {best_bid} | ask {best_ask}")
 
         await subscribe_ir_orderbook(PAIR, on_ob)
 
@@ -72,17 +73,32 @@ async def run_detector():
                     best_ask[0], best_ask[1],
                     timestamp=ob.get("timestamp"),
                 )
-                print(f"[{now()}] [KRAKEN SNAPSHOT] bid {best_bid} | ask {best_ask}")
+                logger.info(f"[KRAKEN SNAPSHOT] bid {best_bid} | ask {best_ask}")
             await asyncio.sleep(10)
 
     async def detector_loop():
         while True:
-            print(f"[{now()}] [DETECTOR] checking arbitrage...")
+            logger.info(f"[DETECTOR] checking arbitrage...")
             detector.check_opportunity()
             await asyncio.sleep(5)
 
+    async def health_logger(csv_path, interval=60):
+        import os
+        while True:
+            try:
+                rows = sum(1 for _ in open(csv_path))
+                logger.info(f"[HEALTH] CSV rows = {rows}")
+            except FileNotFoundError:
+                logger.warning("[HEALTH] No CSV file yet")
+            await asyncio.sleep(interval)
+
     # Run all 3 concurrently
-    await asyncio.gather(ir_updater(), kraken_updater(), detector_loop())
+    await asyncio.gather(
+        ir_updater(),
+        kraken_updater(),
+        detector_loop(),
+        health_logger("/opt/aud_arb/out/tob_snapshots.csv"),
+    )
 
 
 async def main():

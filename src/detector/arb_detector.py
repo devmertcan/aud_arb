@@ -1,16 +1,19 @@
+from utils.logging_config import setup_logger
+logger = setup_logger()
+
 class ArbitrageDetector:
     def __init__(self, orderbooks: dict, threshold=0.007, report_fn=None):
         """
         :param orderbooks: dict of {exchange_name: Orderbook instance}
         :param threshold: minimum relative spread (e.g. 0.007 = 0.7%)
-        :param report_fn: callback for reporting opportunities (default=print)
+        :param report_fn: callback for reporting opportunities (default=logger)
         """
         self.orderbooks = orderbooks
         self.threshold = threshold
-        self.report_fn = report_fn or print  # fallback to console
+        self.report_fn = report_fn or (lambda msg: logger.info(msg))
 
     def report(self, msg: str):
-        """Send message to callback or print"""
+        """Send message to callback or logger"""
         self.report_fn(msg)
 
     def check_opportunity(self):
