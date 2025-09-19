@@ -47,18 +47,26 @@ def test_detector():
     print("=== Step 6: Testing Arbitrage Detector ===")
     ob_a = Orderbook(); ob_b = Orderbook()
 
-    # Force a clear arbitrage: buy at 90, sell at 110 (spread 20)
-    ob_a.apply_snapshot([(89, 1)], [(90, 1)])   # Exchange A
-    ob_b.apply_snapshot([(110, 1)], [(111, 1)]) # Exchange B
+    # Force arbitrage: Exchange A has high bid (wants to buy), Exchange B has cheap ask (to buy from)
+    ob_a.apply_snapshot([(110, 1)], [(111, 1)])  # A willing to pay 110
+    ob_b.apply_snapshot([(90, 1)], [(91, 1)])    # B selling at 91
 
     detector = ArbitrageDetector({"A": ob_a, "B": ob_b}, threshold=0.01)  # 1% threshold
 
+    # Capture print
     triggered = []
-    detector.report_fn = triggered.append
+    def report(msg): triggered.append(msg)
+    # Monkeypatch print temporarily
+    import builtins
+    old_print = builtins.print
+    builtins.print = lambda *args, **kwargs: triggered.append(" ".join(map(str, args)))
+
     detector.check_opportunity()
 
+    builtins.print = old_print  # restore print
     assert triggered, "Detector did not fire"
     print("✅ Step 6: Arbitrage Detector working →", triggered[0])
+
 
 def test_reporter():
     print("=== Step 7: Testing Reporter ===")
