@@ -15,7 +15,7 @@ from reporter.csv_reporter import CSVReporter, TOBReporter
 
 PAIR = os.environ.get("PAIR", "BTC/AUD")
 CSV_PATH = os.environ.get("CSV_PATH", "/opt/aud_arb/out/arb_opps.csv")
-TOB_PATH = os.environ.get("TOB_PATH", "/opt/aud_arb/out/arb_opps.csv")
+TOB_PATH = os.environ.get("TOB_PATH", "/opt/aud_arb/out/tob_snapshots.csv")
 
 
 async def fetch_kraken_snapshot(symbol: str):
