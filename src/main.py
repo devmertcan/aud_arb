@@ -61,7 +61,10 @@ async def run_detector():
                 print(f"[KRAKEN SNAPSHOT] bid {bids[0]} | ask {asks[0]}")
                 # ADD THIS LINE:
                 tob_reporter.write_tob(
-                    "kraken", PAIR, bids[0][0], bids[0][1], asks[0][0], asks[0][1], latest_kraken.get("timestamp")
+                    "kraken", PAIR,
+                    bids[0][0], bids[0][1],
+                    asks[0][0], asks[0][1],
+                    timestamp=latest_kraken.get("timestamp")
                 )
             await asyncio.sleep(10)
 
