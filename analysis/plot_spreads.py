@@ -2,6 +2,10 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from itertools import combinations
+import logging
+from utils.logging_config import setup_logger
+
+logger = setup_logger("plot_spreads")
 
 # ---------- Load and Prepare Data ----------
 csv_path = "/opt/aud_arb/out/tob_snapshots.csv"
@@ -29,7 +33,6 @@ for (ex_a, raw_a), (ex_b, raw_b) in combinations(dfs_raw.items(), 2):
     best_overlap = 0
     best_merged = None
 
-    # Try each window
     for win in windows:
         df_a = raw_a.resample(win).ffill()
         df_b = raw_b.resample(win).ffill()
@@ -39,29 +42,26 @@ for (ex_a, raw_a), (ex_b, raw_b) in combinations(dfs_raw.items(), 2):
             best_window = win
             best_merged = merged
 
-    print(f"[DEBUG] {ex_a} vs {ex_b}: best window={best_window}, rows={best_overlap}")
+    logger.info(f"{ex_a} vs {ex_b}: best window={best_window}, rows={best_overlap}")
 
     if best_merged is None or best_overlap == 0:
+        logger.warning(f"No overlap between {ex_a} and {ex_b}")
         continue
 
     merged = best_merged
 
-    # Spread in both directions
     merged["spread_ab"] = merged[(ex_a, "best_bid_price")] - merged[(ex_b, "best_ask_price")]
     merged["spread_ba"] = merged[(ex_b, "best_bid_price")] - merged[(ex_a, "best_ask_price")]
 
-    # Threshold = 0.7% of average midprice
     avg_mid = (merged[(ex_a, "best_bid_price")] + merged[(ex_b, "best_ask_price")]).mean() / 2
     threshold = 0.007 * avg_mid
 
     merged["success_ab"] = merged["spread_ab"] > threshold
     merged["success_ba"] = merged["spread_ba"] > threshold
 
-    # Hourly success rates
     rate_ab = merged["success_ab"].resample("1h").mean() * 100
     rate_ba = merged["success_ba"].resample("1h").mean() * 100
 
-    # Save summary stats
     pair_stats.append({
         "pair": f"{ex_a} sell vs {ex_b} buy",
         "success_rate_mean": rate_ab.mean(),
@@ -79,8 +79,7 @@ for (ex_a, raw_a), (ex_b, raw_b) in combinations(dfs_raw.items(), 2):
         "samples": len(rate_b.dropna())
     })
 
-    # --- Plot spread for visual check ---
-    plt.figure(figsize=(12,6))
+    plt.figure(figsize=(12, 6))
     plt.plot(merged.index, merged["spread_ab"], label=f"{ex_a} bid - {ex_b} ask")
     plt.axhline(threshold, color="red", linestyle="--", label="0.7% threshold")
     plt.title(f"Cross-Exchange Spread: {ex_a} vs {ex_b} (window={best_window})")
@@ -89,17 +88,15 @@ for (ex_a, raw_a), (ex_b, raw_b) in combinations(dfs_raw.items(), 2):
     plt.tight_layout()
     plt.show()
 
-# ---------- Save Pair Stats CSV ----------
 pair_df = pd.DataFrame(pair_stats)
-
 if pair_df.empty:
-    print("[WARN] No overlapping data found between any exchange pairs.")
+    logger.warning("No overlapping data found between any exchange pairs.")
 else:
     pair_df = pair_df.sort_values("success_rate_mean", ascending=False)
     pair_csv = "/opt/aud_arb/out/pair_success_rate.csv"
     pair_df.to_csv(pair_csv, index=False)
-    print(f"[INFO] Saved pair success rates to {pair_csv}")
-    print(pair_df.head())
+    logger.info(f"Saved pair success rates to {pair_csv}")
+    logger.info(pair_df.head())
 
     # ---------- Heatmap with Samples ----------
     heatmap_df = pair_df.copy()

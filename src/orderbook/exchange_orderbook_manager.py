@@ -1,15 +1,10 @@
 from typing import List, Tuple, Dict, Optional, Callable, Any
+import logging
+from utils.logging_config import setup_logger
+
+logger = setup_logger("orderbook_manager")
 
 class ExchangeOrderBookManager:
-    """
-    Exchange-agnostic in-memory order book with:
-      - id map (order_id -> (side, price))
-      - sequence/nonce validation
-      - async resync via REST snapshot when gaps detected
-      - pluggable event parser: event -> list[(action, kwargs)]
-      - timestamp tracking
-      - midprice calculation
-    """
     def __init__(self, exchange_id: str, depth: int = 20, gap_threshold: int = 1):
         self.exchange_id = exchange_id
         self.bids: Dict[float, float] = {}
@@ -35,6 +30,7 @@ class ExchangeOrderBookManager:
         self.in_sync = True
         self.missed_updates = 0
         self.last_update_ts = ts
+        logger.info(f"[{self.exchange_id}] Snapshot applied: {len(bids)} bids, {len(asks)} asks")
 
     async def check_seq(self, seq: Optional[int]) -> bool:
         if seq is None:
@@ -47,13 +43,12 @@ class ExchangeOrderBookManager:
             self.missed_updates = 0
             return True
 
-        # gap or reset
         self.missed_updates += 1
-        print(f"[WARN][{self.exchange_id}] seq gap {self.missed_updates}/{self.gap_threshold} (last={self.last_seq}, now={seq})")
+        logger.warning(f"[{self.exchange_id}] seq gap {self.missed_updates}/{self.gap_threshold} (last={self.last_seq}, now={seq})")
         self.last_seq = seq
 
         if self.missed_updates >= self.gap_threshold and self.resync_callback:
-            print(f"[ACTION][{self.exchange_id}] resync via REST snapshot…")
+            logger.warning(f"[{self.exchange_id}] resync via REST snapshot…")
             snapshot = await self.resync_callback()
             await self.apply_snapshot(snapshot["bids"], snapshot["asks"], snapshot.get("timestamp"))
             self.in_sync = True
@@ -95,7 +90,6 @@ class ExchangeOrderBookManager:
         book = self.bids if side == "bid" else self.asks
         book.pop(price, None)
 
-    # Convenience
     def best_bid(self):
         return max(self.bids.items(), key=lambda x: x[0], default=None)
 
