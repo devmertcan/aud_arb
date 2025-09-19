@@ -2,7 +2,6 @@ import asyncio
 import websockets
 import json
 
-
 async def ws_listen(url, subscribe_message, on_msg):
     async with websockets.connect(url) as ws:
         if subscribe_message:
@@ -11,19 +10,30 @@ async def ws_listen(url, subscribe_message, on_msg):
             data = json.loads(msg)
             await on_msg(data)
 
+async def subscribe_ir_orderbook(symbol: str, callback=None):
+    url = "wss://websockets.independentreserve.com/?subscribe=orderbook-xbt"
 
-async def subscribe_ir_orderbook(symbol: str, callback):
-    url = f"wss://websockets.independentreserve.com/?subscribe=orderbook-xbt"
-    # NOTE: IR uses XBT not BTC for Bitcoin pairs
     async def on_msg(data):
-        if data.get("Event") in ["NewOrder", "OrderChanged", "OrderCanceled"]:
-            # Simplified normalized orderbook (partial)
-            ob = {
-                "bids": [(data["Data"]["Price"]["aud"], data["Data"]["Volume"])]
-                if data["Data"]["OrderType"] == "LimitBid" else [],
-                "asks": [(data["Data"]["Price"]["aud"], data["Data"]["Volume"])]
-                if data["Data"]["OrderType"] == "LimitOffer" else [],
-                "timestamp": data.get("Time"),
-            }
-            await callback(ob)
+        event = data.get("Event")
+        if event in ["NewOrder"]:
+            price = data["Data"]["Price"]["aud"]
+            volume = data["Data"]["Volume"]
+            if data["Data"]["OrderType"] == "LimitBid":
+                ob = {"bids": [(price, volume)], "asks": [], "timestamp": data.get("Time")}
+            else:
+                ob = {"bids": [], "asks": [(price, volume)], "timestamp": data.get("Time")}
+            if callback:
+                await callback(ob)
+
+        elif event in ["OrderChanged", "OrderCanceled"]:
+            # These don’t include price, just volume changes or removals
+            # For now, just ignore them (later you can wire this into OrderbookManager)
+            return
+
+        elif event == "Subscriptions":
+            print("[IR] Subscribed:", data.get("Data"))
+
+        elif event == "Heartbeat":
+            print("[IR] Heartbeat")
+
     await ws_listen(url, None, on_msg)
