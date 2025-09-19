@@ -75,14 +75,18 @@ for (ex_a, df_a), (ex_b, df_b) in combinations(dfs.items(), 2):
     plt.show()
 
 # ---------- Save Pair Stats CSV ----------
-pair_df = pd.DataFrame(pair_stats).sort_values("success_rate_mean", ascending=False)
-pair_csv = "/opt/aud_arb/out/pair_success_rate.csv"
-pair_df.to_csv(pair_csv, index=False)
-print(f"[INFO] Saved pair success rates to {pair_csv}")
-print(pair_df.head())
+pair_df = pd.DataFrame(pair_stats)
 
-# ---------- Heatmap with Samples ----------
-if not pair_df.empty:
+if pair_df.empty:
+    print("[WARN] No overlapping data found between any exchange pairs.")
+else:
+    pair_df = pair_df.sort_values("success_rate_mean", ascending=False)
+    pair_csv = "/opt/aud_arb/out/pair_success_rate.csv"
+    pair_df.to_csv(pair_csv, index=False)
+    print(f"[INFO] Saved pair success rates to {pair_csv}")
+    print(pair_df.head())
+
+    # Heatmap
     heatmap_df = pair_df.copy()
     heatmap_df["sell"] = heatmap_df["pair"].apply(lambda x: x.split(" sell vs ")[0])
     heatmap_df["buy"] = heatmap_df["pair"].apply(lambda x: x.split(" sell vs ")[1].replace(" buy",""))
@@ -90,9 +94,10 @@ if not pair_df.empty:
     matrix_rate = heatmap_df.pivot(index="sell", columns="buy", values="success_rate_mean")
     matrix_samples = heatmap_df.pivot(index="sell", columns="buy", values="samples")
 
-    # Annotation: "rate% (samples)"
     annot = matrix_rate.round(1).astype(str) + "% (" + matrix_samples.fillna(0).astype(int).astype(str) + ")"
 
+    import seaborn as sns
+    import matplotlib.pyplot as plt
     plt.figure(figsize=(9,7))
     sns.heatmap(matrix_rate, annot=annot, fmt="", cmap="YlGnBu",
                 cbar_kws={'label': 'Success Rate (%)'})
@@ -101,5 +106,4 @@ if not pair_df.empty:
     plt.xlabel("Buy Exchange")
     plt.tight_layout()
     plt.show()
-else:
-    print("[WARN] No overlapping data found between exchanges after resampling.")
+
