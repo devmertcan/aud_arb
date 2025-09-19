@@ -9,8 +9,9 @@ class CCXTRestConnector:
     async def get_orderbook_rest(self, symbol: str):
         ob = await self.exchange.fetch_order_book(symbol)
         return {
-            "bids": [(float(p), float(v)) for p, v in ob.get("bids", [])],
-            "asks": [(float(p), float(v)) for p, v in ob.get("asks", [])],
+            # Only use price and volume (ignore extra fields)
+            "bids": [(float(p[0]), float(p[1])) for p in ob.get("bids", [])],
+            "asks": [(float(p[0]), float(p[1])) for p in ob.get("asks", [])],
             "timestamp": ob.get("timestamp"),
         }
 
