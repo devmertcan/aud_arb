@@ -1,14 +1,20 @@
 class ArbitrageDetector:
     def __init__(self, orderbooks: dict, threshold=0.007, report_fn=None):
+        """
+        :param orderbooks: dict of {exchange_name: Orderbook instance}
+        :param threshold: minimum relative spread (e.g. 0.007 = 0.7%)
+        :param report_fn: callback for reporting opportunities (default=print)
+        """
         self.orderbooks = orderbooks
-        self.threshold = threshold  # e.g. 0.7%
-        self.report_fn = report_fn or print   # default to print if none provided
+        self.threshold = threshold
+        self.report_fn = report_fn or print  # fallback to console
 
     def report(self, msg: str):
-        """Send opportunity to callback or print"""
+        """Send message to callback or print"""
         self.report_fn(msg)
 
     def check_opportunity(self):
+        """Compare best bid/ask across exchanges and report arbitrage"""
         ex_names = list(self.orderbooks.keys())
         for i in range(len(ex_names)):
             for j in range(i + 1, len(ex_names)):
