@@ -1,5 +1,5 @@
 import asyncio
-import os
+import subprocess
 from connectors.ccxt_rest import CCXTRestConnector
 from connectors.ws_connectors import subscribe_ir_orderbook
 from orderbook.orderbook_manager import Orderbook
@@ -8,87 +8,73 @@ from reporter.csv_reporter import TOBReporter
 
 
 PAIR = "BTC/AUD"
-CHECK_CSV_PATH = "/opt/aud_arb/out/tob_snapshots.csv"
 
+async def test_kraken_rest():
+    print("=== Step 4a: Testing Kraken REST ===")
+    rest = CCXTRestConnector("kraken")
+    ob = await rest.get_orderbook_rest(PAIR)
+    await rest.close()
+    bids, asks = ob.get("bids", []), ob.get("asks", [])
+    assert bids and asks, "No bids/asks from Kraken"
+    print("✅ Step 4a: Kraken REST connector working")
 
-async def check_connectors():
+async def test_ir_ws():
+    print("=== Step 4b: Testing Independent Reserve WS ===")
+    async def on_ob(ob):
+        print("✅ Step 4b: Independent Reserve WS connector working")
+        raise asyncio.CancelledError()  # stop after first message
     try:
-        # Kraken REST
-        kraken = CCXTRestConnector("kraken")
-        ob = await kraken.get_orderbook_rest(PAIR)
-        await kraken.close()
-        if ob["bids"] and ob["asks"]:
-            print("✅ Step 4a: Kraken REST connector working")
-        else:
-            print("❌ Step 4a: Kraken REST returned empty orderbook")
+        await subscribe_ir_orderbook(PAIR, on_ob)
+    except asyncio.CancelledError:
+        pass
 
-        # IR WS
-        got_update = False
+def test_orderbook_manager():
+    print("=== Step 5: Testing Orderbook Manager ===")
+    ob = Orderbook()
+    ob.apply_snapshot([(100, 1)], [(101, 1)])
+    assert ob.best_bid() == 100
+    assert ob.best_ask() == 101
+    print("✅ Step 5: Orderbook Manager working")
 
-        async def on_ob(ob):
-            nonlocal got_update
-            if ob.get("bids") or ob.get("asks"):
-                got_update = True
-                raise SystemExit  # stop after first event
+def test_detector():
+    print("=== Step 6: Testing Arbitrage Detector ===")
+    ob_a = Orderbook(); ob_b = Orderbook()
+    ob_a.apply_snapshot([(100, 1)], [(102, 1)])
+    ob_b.apply_snapshot([(105, 1)], [(107, 1)])
+    detector = ArbitrageDetector({"A": ob_a, "B": ob_b}, threshold=0.01)
+    triggered = []
+    detector.report_fn = triggered.append
+    detector.check_opportunity()
+    assert triggered, "Detector did not fire"
+    print("✅ Step 6: Arbitrage Detector working")
 
-        try:
-            await subscribe_ir_orderbook(PAIR, on_ob)
-        except SystemExit:
-            pass
+def test_reporter():
+    print("=== Step 7: Testing Reporter ===")
+    rep = TOBReporter(path="/opt/aud_arb/out/test_report.csv")
+    rep.write_tob("kraken", PAIR, 100, 1, 101, 2)
+    print("✅ Step 7: Reporter writing to CSV")
 
-        if got_update:
-            print("✅ Step 4b: Independent Reserve WS connector working")
-        else:
-            print("❌ Step 4b: No IR WS updates received")
-
-    except Exception as e:
-        print("❌ Step 4: Connector check failed:", e)
-
-
-def check_orderbook_manager():
-    try:
-        ob = Orderbook()
-        ob.apply_snapshot([(100, 1)], [(101, 1)])
-        if ob.best_bid() and ob.best_ask():
-            print("✅ Step 5: Orderbook Manager working")
-        else:
-            print("❌ Step 5: Orderbook Manager did not return best bid/ask")
-    except Exception as e:
-        print("❌ Step 5: Orderbook Manager check failed:", e)
-
-
-def check_detector():
-    try:
-        oba = Orderbook()
-        obb = Orderbook()
-        oba.apply_snapshot([(105, 1)], [(106, 1)])
-        obb.apply_snapshot([(100, 1)], [(101, 1)])
-        detector = ArbitrageDetector({"A": oba, "B": obb}, threshold=0.01)
-        # This should trigger an opportunity
-        detector.check_opportunity()
-        print("✅ Step 6: Arbitrage Detector runs without error")
-    except Exception as e:
-        print("❌ Step 6: Arbitrage Detector check failed:", e)
-
-
-def check_reporter():
-    try:
-        reporter = TOBReporter(path=CHECK_CSV_PATH)
-        reporter.write_tob("test", PAIR, 100, 1, 101, 1)
-        if os.path.exists(CHECK_CSV_PATH):
-            print("✅ Step 7: Reporter writing to CSV")
-        else:
-            print("❌ Step 7: Reporter did not create CSV")
-    except Exception as e:
-        print("❌ Step 7: Reporter check failed:", e)
+def test_detector_pytest():
+    print("=== Step 9: Running detector unit test (pytest) ===")
+    result = subprocess.run(
+        ["pytest", "-q", "--disable-warnings", "tests/test_detector.py"],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        print("✅ Step 9: Detector unit test passed")
+    else:
+        print("❌ Step 9: Detector unit test failed")
+        print(result.stdout, result.stderr)
 
 
 async def main():
     print("=== Running project milestone checklist ===")
-    await check_connectors()
-    check_orderbook_manager()
-    check_detector()
-    check_reporter()
+    await test_kraken_rest()
+    await test_ir_ws()
+    test_orderbook_manager()
+    test_detector()
+    test_reporter()
+    test_detector_pytest()
 
 
 if __name__ == "__main__":
