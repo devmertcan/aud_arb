@@ -46,13 +46,19 @@ async def demo_run(duration=120):
             detector.check_opportunity()
             await asyncio.sleep(5)
 
-    # Run for N seconds then cancel
-    tasks = [asyncio.create_task(ir_updater()), asyncio.create_task(kraken_updater()), asyncio.create_task(detector_loop())]
-    await asyncio.sleep(duration)
-    for t in tasks:
-        t.cancel()
-    await rest.close()
-    print(f"\n✅ Demo run finished after {duration}s. Check /opt/aud_arb/out/test_concurrency.csv for results.")
+    tasks = [
+        asyncio.create_task(ir_updater()),
+        asyncio.create_task(kraken_updater()),
+        asyncio.create_task(detector_loop())
+    ]
+
+    try:
+        await asyncio.sleep(duration)
+    finally:
+        for t in tasks:
+            t.cancel()
+        await rest.close()
+        print(f"\n✅ Demo run finished after {duration}s. Check /opt/aud_arb/out/test_concurrency.csv for results.")
 
 
 if __name__ == "__main__":
