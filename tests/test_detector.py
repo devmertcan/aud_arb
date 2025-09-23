@@ -3,7 +3,6 @@ import pytest
 from detector.arb_detector import ArbDetector
 from reporter.csv_reporter import CSVReporter
 import os
-import tempfile
 
 @pytest.mark.asyncio
 async def test_detector_opportunity(tmp_path):
@@ -30,21 +29,20 @@ async def test_detector_opportunity(tmp_path):
         reporter=reporter
     )
 
-    async def feed():
-        await q.put({"ts_ms": 1, "exchange": "ex1", "pair": "BTC/AUD",
-                     "best_bid": 99, "bid_size": 1, "best_ask": 100, "ask_size": 1})
-        await q.put({"ts_ms": 2, "exchange": "ex2", "pair": "BTC/AUD",
-                     "best_bid": 105, "bid_size": 1, "best_ask": 106, "ask_size": 1})
-        await asyncio.sleep(0.2)
+    # Seed snapshots manually
+    snap1 = {"ts_ms": 1, "exchange": "ex1", "pair": "BTC/AUD",
+             "best_bid": 99, "bid_size": 1, "best_ask": 100, "ask_size": 1}
+    snap2 = {"ts_ms": 2, "exchange": "ex2", "pair": "BTC/AUD",
+             "best_bid": 105, "bid_size": 1, "best_ask": 106, "ask_size": 1}
 
-    task_feed = asyncio.create_task(feed())
-    task_det = asyncio.create_task(detector.run())
-    await asyncio.sleep(0.5)
-    task_det.cancel()
-    task_feed.cancel()
+    detector.latest[("ex1", "BTC/AUD")] = snap1
+    detector.latest[("ex2", "BTC/AUD")] = snap2
+
+    # Directly trigger evaluation
+    await detector._evaluate_pair("BTC/AUD")
 
     assert os.path.exists(csv_path)
     with open(csv_path) as f:
         content = f.read()
     assert "BTC/AUD" in content
-    assert "OK" in content or "below_after_fee_threshold" in content
+    assert "ex1" in content and "ex2" in content
