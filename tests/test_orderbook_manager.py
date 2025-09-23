@@ -1,41 +1,30 @@
 import asyncio
-from orderbook.exchange_orderbook_manager import ExchangeOrderBookManager
+import pytest
+from orderbook.exchange_orderbook_manager import ExchangeOrderbookManager
 
-async def fake_resync():
-    print("[REST] Fetching fresh snapshot...")
-    return {
-        "bids": [(100.0, 1.0), (99.0, 2.0)],
-        "asks": [(101.0, 1.5), (102.0, 3.0)],
-        "timestamp": 1234567890,
-    }
+@pytest.mark.asyncio
+async def test_manager_queue(monkeypatch):
+    # fake CCXTRest client to inject snapshots
+    async def fake_stream_pairs(self, pairs, out_queue):
+        await out_queue.put({
+            "ts_ms": 123,
+            "exchange": "fake",
+            "pair": "BTC/AUD",
+            "best_bid": 100,
+            "bid_size": 1,
+            "best_ask": 101,
+            "ask_size": 2,
+            "source": "REST"
+        })
+        await asyncio.sleep(0.1)
 
-async def run_tests():
-    ob = ExchangeOrderBookManager("test-exchange", depth=5, gap_threshold=2)
-    ob.resync_callback = fake_resync
+    monkeypatch.setattr(
+        "connectors.ccxt_rest.CCXTRest.stream_pairs", fake_stream_pairs
+    )
 
-    # Apply initial snapshot
-    await ob.apply_snapshot([(100.0, 1.0)], [(101.0, 1.5)], ts=111)
-    print("Initial midprice:", ob.midprice())
-
-    # Simulate NewOrder
-    ob._add_order(order_id="abc", side="bid", price=99.5, volume=0.8)
-    print("Best bid after new order:", ob.best_bid())
-
-    # Simulate correct nonce sequence
-    await ob.check_seq(1)
-    await ob.check_seq(2)
-    print("Seq OK, in_sync:", ob.in_sync)
-
-    # Simulate gap (jump from 2 → 5)
-    await ob.check_seq(5)
-    print("After gap (below threshold), in_sync:", ob.in_sync)
-
-    # Simulate another gap (resync should trigger)
-    await ob.check_seq(8)
-    print("After 2nd gap (threshold reached), in_sync:", ob.in_sync)
-
-    # Check spread
-    print("Spread:", ob.spread())
-
-if __name__ == "__main__":
-    asyncio.run(run_tests())
+    manager = ExchangeOrderbookManager(["fake"], ["BTC/AUD"], poll_interval_ms_rest=100)
+    task = asyncio.create_task(manager._start_rest("fake", ["BTC/AUD"], asyncio.Semaphore(1)))
+    snap = await manager.queue.get()
+    assert snap["exchange"] == "fake"
+    assert snap["pair"] == "BTC/AUD"
+    task.cancel()

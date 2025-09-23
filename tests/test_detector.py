@@ -1,24 +1,50 @@
-# tests/test_detector.py
-from detector.arb_detector import ArbitrageDetector
-from orderbook.orderbook_manager import Orderbook
+import asyncio
+import pytest
+from detector.arb_detector import ArbDetector
+from reporter.csv_reporter import CSVReporter
+import os
+import tempfile
 
-def test_detector_simple_opportunity():
-    # Create fake orderbooks
-    ob_a = Orderbook()
-    ob_b = Orderbook()
-    ob_a.apply_snapshot(bids=[(100, 1)], asks=[(102, 1)])
-    ob_b.apply_snapshot(bids=[(105, 1)], asks=[(107, 1)])
+@pytest.mark.asyncio
+async def test_detector_opportunity(tmp_path):
+    q = asyncio.Queue()
+    csv_path = tmp_path / "out.csv"
+    reporter = CSVReporter(str(csv_path))
 
-    orderbooks = {"A": ob_a, "B": ob_b}
-    detector = ArbitrageDetector(orderbooks, threshold=0.01)  # 1% threshold
+    fee_cfg = {
+        "default_taker_pct": 0.2,
+        "per_exchange_taker_pct": {}
+    }
+    det_cfg = {
+        "min_spread_pct_after_fees": 0.1,  # easy to trigger
+        "min_notional_aud": 1.0,
+        "max_age_ms": 10000
+    }
 
-    opportunities = []
+    detector = ArbDetector(
+        queue=q,
+        exchanges=["ex1", "ex2"],
+        pairs=["BTC/AUD"],
+        detection_cfg=det_cfg,
+        fee_cfg=fee_cfg,
+        reporter=reporter
+    )
 
-    def capture(msg):
-        opportunities.append(msg)
+    async def feed():
+        await q.put({"ts_ms": 1, "exchange": "ex1", "pair": "BTC/AUD",
+                     "best_bid": 99, "bid_size": 1, "best_ask": 100, "ask_size": 1})
+        await q.put({"ts_ms": 2, "exchange": "ex2", "pair": "BTC/AUD",
+                     "best_bid": 105, "bid_size": 1, "best_ask": 106, "ask_size": 1})
+        await asyncio.sleep(0.2)
 
-    detector.report_fn = capture
-    detector.check_opportunity()
+    task_feed = asyncio.create_task(feed())
+    task_det = asyncio.create_task(detector.run())
+    await asyncio.sleep(0.5)
+    task_det.cancel()
+    task_feed.cancel()
 
-    assert len(opportunities) > 0, "Detector should find arbitrage"
-    print("✅ Detector test passed:", opportunities[0])
+    assert os.path.exists(csv_path)
+    with open(csv_path) as f:
+        content = f.read()
+    assert "BTC/AUD" in content
+    assert "OK" in content or "below_after_fee_threshold" in content

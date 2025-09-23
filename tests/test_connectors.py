@@ -1,34 +1,21 @@
 import asyncio
-from connectors.ccxt_rest import CCXTRestConnector
-from connectors.ws_connectors import subscribe_ir_orderbook
+import pytest
+from connectors.ccxt_rest import CCXTRest
 
+@pytest.mark.asyncio
+async def test_fetch_ticker_best(monkeypatch):
+    ex = CCXTRest("kraken", poll_interval_ms=500)
 
-PAIR = "BTC/AUD"
+    async def fake_order_book(symbol, limit=5):
+        return {"bids": [[100, 1.0]], "asks": [[101, 2.0]]}
 
+    monkeypatch.setattr(ex.exchange, "fetch_order_book", fake_order_book)
 
-async def test_kraken_rest():
-    print("=== Testing Kraken REST ===")
-    r = CCXTRestConnector("kraken")
-    ob = await r.get_orderbook_rest(PAIR)
-    print("Kraken REST top levels:", ob["bids"][:1], ob["asks"][:1])
-    await r.close()
-
-
-async def test_ir_ws():
-    print("=== Testing Independent Reserve WebSocket ===")
-
-    async def on_ob(ob):
-        bids, asks = ob.get("bids", []), ob.get("asks", [])
-        if bids or asks:
-            print("IR WS update:", bids[:1], asks[:1])
-
-    await asyncio.wait_for(subscribe_ir_orderbook(PAIR, on_ob), timeout=60)
-
-
-async def main():
-    await test_kraken_rest()
-    await test_ir_ws()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    result = await ex.fetch_ticker_best("BTC/AUD")
+    assert result is not None
+    best_bid, bid_size, best_ask, ask_size = result
+    assert best_bid == 100
+    assert best_ask == 101
+    assert bid_size == 1.0
+    assert ask_size == 2.0
+    await ex.close()

@@ -1,121 +1,58 @@
-from typing import List, Tuple, Dict, Optional, Callable, Any
-import logging
-from utils.logging_config import setup_logger
+import asyncio
+from typing import Dict, List, Optional
 
-logger = setup_logger("orderbook_manager")
+from connectors.ccxt_rest import CCXTRest
+from connectors.ws_connectors import OKXWS, KrakenWS
 
-class ExchangeOrderBookManager:
-    def __init__(self, exchange_id: str, depth: int = 20, gap_threshold: int = 1):
-        self.exchange_id = exchange_id
-        self.bids: Dict[float, float] = {}
-        self.asks: Dict[float, float] = {}
-        self.id_map: Dict[str, Tuple[str, float]] = {}
+class ExchangeOrderbookManager:
+    """
+    Creates one producer task per exchange (WS if available, else REST) that feeds a shared queue with best bid/ask snapshots.
+    Consumers (detector) read from the queue and maintain a latest-snapshot map keyed by (exchange, pair).
+    """
 
-        self.depth = depth
-        self.last_seq: Optional[int] = None
-        self.in_sync: bool = True
+    WS_CAPABLE = {"okx", "kraken"}
 
-        self.gap_threshold = gap_threshold
-        self.missed_updates = 0
-        self.last_update_ts: Optional[int] = None
+    def __init__(self, exchanges: List[str], pairs: List[str], poll_interval_ms_rest: int, max_concurrency: int = 200):
+        self.exchanges = [e.lower() for e in exchanges]
+        self.pairs = pairs
+        self.poll_rest_ms = poll_interval_ms_rest
+        self.max_concurrency = max_concurrency
+        self.queue: asyncio.Queue = asyncio.Queue(maxsize=4_096)
+        self._tasks: List[asyncio.Task] = []
+        self._stopped = False
 
-        self.resync_callback: Optional[Callable[[], Any]] = None
-        self.parser: Optional[Callable[[Dict], List[Tuple[str, Any]]]] = None
+    async def start(self):
+        sem = asyncio.Semaphore(self.max_concurrency)
+        for ex in self.exchanges:
+            if ex in self.WS_CAPABLE:
+                producer = self._start_ws(ex, self.pairs, sem)
+            else:
+                producer = self._start_rest(ex, self.pairs, sem)
+            self._tasks.append(asyncio.create_task(producer))
 
-    async def apply_snapshot(self, bids: List[Tuple[float, float]], asks: List[Tuple[float, float]], ts: Optional[int] = None):
-        self.bids = {p: v for p, v in bids}
-        self.asks = {p: v for p, v in asks}
-        self.id_map.clear()
-        self.last_seq = None
-        self.in_sync = True
-        self.missed_updates = 0
-        self.last_update_ts = ts
-        logger.info(f"[{self.exchange_id}] Snapshot applied: {len(bids)} bids, {len(asks)} asks")
+    async def stop(self):
+        self._stopped = True
+        for t in self._tasks:
+            t.cancel()
+        await asyncio.gather(*self._tasks, return_exceptions=True)
 
-    async def check_seq(self, seq: Optional[int]) -> bool:
-        if seq is None:
-            return True
-        if self.last_seq is None:
-            self.last_seq = seq
-            return True
-        if seq == self.last_seq + 1:
-            self.last_seq = seq
-            self.missed_updates = 0
-            return True
-
-        self.missed_updates += 1
-        logger.warning(f"[{self.exchange_id}] seq gap {self.missed_updates}/{self.gap_threshold} (last={self.last_seq}, now={seq})")
-        self.last_seq = seq
-
-        if self.missed_updates >= self.gap_threshold and self.resync_callback:
-            logger.warning(f"[{self.exchange_id}] resync via REST snapshot…")
-            snapshot = await self.resync_callback()
-            await self.apply_snapshot(snapshot["bids"], snapshot["asks"], snapshot.get("timestamp"))
-            self.in_sync = True
-            self.missed_updates = 0
-        return False
-
-    def update_from_event(self, event: Dict):
-        if not self.parser:
-            raise ValueError(f"No parser set for {self.exchange_id}")
-        actions = self.parser(event)
-        self.last_update_ts = event.get("Time", self.last_update_ts)
-        for action, kwargs in actions:
-            if action == "add":
-                self._add_order(**kwargs)
-            elif action == "change":
-                self._change_order(**kwargs)
-            elif action == "cancel":
-                self._cancel_order(**kwargs)
-
-    def _add_order(self, order_id: str, side: str, price: float, volume: float):
-        book = self.bids if side == "bid" else self.asks
-        book[price] = volume
-        self.id_map[order_id] = (side, price)
-
-    def _change_order(self, order_id: str, volume: float):
-        if order_id not in self.id_map:
-            return
-        side, price = self.id_map[order_id]
-        book = self.bids if side == "bid" else self.asks
-        if volume == 0:
-            self._cancel_order(order_id)
+    async def _start_ws(self, exchange: str, pairs: List[str], sem: asyncio.Semaphore):
+        if exchange == "okx":
+            ws = OKXWS()
+        elif exchange == "kraken":
+            ws = KrakenWS()
         else:
-            book[price] = volume
-
-    def _cancel_order(self, order_id: str):
-        if order_id not in self.id_map:
             return
-        side, price = self.id_map.pop(order_id)
-        book = self.bids if side == "bid" else self.asks
-        book.pop(price, None)
+        try:
+            async with sem:
+                await ws.stream_pairs(pairs, self.queue)
+        finally:
+            await ws.close()
 
-    def best_bid(self):
-        return max(self.bids.items(), key=lambda x: x[0], default=None)
-
-    def best_ask(self):
-        return min(self.asks.items(), key=lambda x: x[0], default=None)
-
-    def midprice(self) -> Optional[float]:
-        if not self.bids or not self.asks:
-            return None
-        return (self.best_bid()[0] + self.best_ask()[0]) / 2
-
-    def top_bids(self):
-        return sorted(self.bids.items(), key=lambda x: -x[0])[:self.depth]
-
-    def top_asks(self):
-        return sorted(self.asks.items(), key=lambda x: x[0])[:self.depth]
-
-    def spread(self):
-        if not self.bids or not self.asks:
-            return None
-        return self.best_ask()[0] - self.best_bid()[0]
-
-    def as_dict(self):
-        return {
-            "bids": self.top_bids(),
-            "asks": self.top_asks(),
-            "midprice": self.midprice(),
-            "timestamp": self.last_update_ts,
-        }
+    async def _start_rest(self, exchange: str, pairs: List[str], sem: asyncio.Semaphore):
+        client = CCXTRest(exchange, poll_interval_ms=self.poll_rest_ms)
+        try:
+            async with sem:
+                await client.stream_pairs(pairs, self.queue)
+        finally:
+            await client.close()
