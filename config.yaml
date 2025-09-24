@@ -1,58 +1,32 @@
-# Runtime configuration for AUD arbitrage detector
-
-# Exchanges to monitor (lowercase, ccxt ids where applicable)
-exchanges:
-  - kraken
-  - independentreserve
-  - swyftx
-  - coinspot
-  - okx
-  - btcmarkets
-
-# Trading pairs (all AUD-quoted)
-pairs:
+# detection parameters (tweak anytime)
+min_profit_bps: 70         # 0.70% after fees/slippage
+slippage_bps: 10           # cushion for fills
+poll_ms: 500               # REST polling cadence per symbol per exchange
+log_dir: "./logs"
+out_dir: "./out"
+symbols:                   # AUD focus
   - BTC/AUD
   - ETH/AUD
   - SOL/AUD
-  - DOGE/AUD
   - XRP/AUD
-  - MATIC/AUD
-  - SHIB/AUD
   - ADA/AUD
+  - MATIC/AUD
   - LINK/AUD
   - DOT/AUD
   - AVAX/AUD
   - LTC/AUD
-
-# Detection parameters
-detection:
-  min_spread_pct_after_fees: 0.7        # percent, after fee model below
-  min_notional_aud: 200.0               # ignore tiny quotes
-  max_age_ms: 1500                      # stale quote cutoff
-  confidence_min: 0.35                  # optional score: 0..1 (orderbook depth/consistency)
-  poll_interval_ms_rest: 800            # REST polling cadence per symbol (if no WS)
-  rebalance_hint_threshold_pct: 0.9     # when to suggest rebalance (after-fee)
-
-# Fee & slippage model (very simple, per-side taker fee, in percent)
-# Tweak as needed; used for after-fee spread calc.
-fees:
-  default_taker_pct: 0.20               # 0.20% per side default
-  per_exchange_taker_pct:
-    kraken: 0.26
-    independentreserve: 0.50
-    swyftx: 0.60
-    coinspot: 0.10
-    okx: 0.10
-    btcmarkets: 0.85
-
-# Paths
-io:
-  csv_path: "/opt/aud_arb/out/tob_snapshots.csv"
-  log_path: "/opt/aud_arb/logs/bot.log"
-
-logging:
-  level: "INFO"
-
-system:
-  # Max concurrent tasks (exchanges * pairs) – safeguard
-  max_concurrency: 200
+  - DOGE/AUD
+  - SHIB/AUD
+exchanges:                 # CCXT ids
+  - kraken
+  - independentreserve
+  - btcmarkets
+  - okx
+  - coinspot
+fees_bps:                  # conservative taker assumptions (override later)
+  kraken: 26               # 0.26%
+  independentreserve: 50   # 0.50%
+  btcmarkets: 35           # 0.35% (mid of schedule)
+  okx: 10                  # 0.10% (tiered; adjust per acct)
+  coinspot: 100            # 1.00% retail; adjust if eligible for lower
+# note: Swyftx is not in CCXT; integrate later via their JWT API if needed.
