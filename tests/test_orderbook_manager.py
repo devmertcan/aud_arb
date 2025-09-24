@@ -8,7 +8,7 @@ async def test_manager_queue(monkeypatch):
     async def fake_stream_pairs(self, pairs, out_queue):
         await out_queue.put({
             "ts_ms": 123,
-            "exchange": "fake",
+            "exchange": "kraken",
             "pair": "BTC/AUD",
             "best_bid": 100,
             "bid_size": 1,
@@ -16,21 +16,19 @@ async def test_manager_queue(monkeypatch):
             "ask_size": 2,
             "source": "REST"
         })
-        return  # exit immediately
+        return
 
     monkeypatch.setattr(
         "connectors.ccxt_rest.CCXTRest.stream_pairs", fake_stream_pairs
     )
 
-    # Create manager but don't call _start_rest (infinite loop)
-    manager = ExchangeOrderbookManager(["fake"], ["BTC/AUD"], poll_interval_ms_rest=100)
+    manager = ExchangeOrderbookManager(["kraken"], ["BTC/AUD"], poll_interval_ms_rest=100)
 
-    # Directly run the patched method once
-    await manager._start_rest("fake", ["BTC/AUD"], asyncio.Semaphore(1))
+    # Call once, then exit
+    await manager._start_rest("kraken", ["BTC/AUD"], asyncio.Semaphore(1))
 
-    # Verify snapshot came through
     snap = await manager.queue.get()
-    assert snap["exchange"] == "fake"
+    assert snap["exchange"] == "kraken"
     assert snap["pair"] == "BTC/AUD"
     assert snap["best_bid"] == 100
     assert snap["best_ask"] == 101
