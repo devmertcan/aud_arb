@@ -1,10 +1,12 @@
 # detection parameters (tweak anytime)
 min_profit_bps: 70         # 0.70% after fees/slippage
 slippage_bps: 10           # cushion for fills
-poll_ms: 500               # REST polling cadence per symbol per exchange
+poll_ms: 500               # REST/Web poll cadence per symbol per exchange (ms)
 log_dir: "./logs"
 out_dir: "./out"
-symbols:                   # AUD focus
+
+# AUD focus
+symbols:
   - BTC/AUD
   - ETH/AUD
   - SOL/AUD
@@ -17,16 +19,21 @@ symbols:                   # AUD focus
   - LTC/AUD
   - DOGE/AUD
   - SHIB/AUD
-exchanges:                 # CCXT ids
+
+# Exchanges (CCXT + custom swyftx)
+exchanges:
   - kraken
   - independentreserve
   - btcmarkets
   - okx
   - coinspot
-fees_bps:                  # conservative taker assumptions (override later)
-  kraken: 26               # 0.26%
-  independentreserve: 50   # 0.50%
-  btcmarkets: 35           # 0.35% (mid of schedule)
-  okx: 10                  # 0.10% (tiered; adjust per acct)
-  coinspot: 100            # 1.00% retail; adjust if eligible for lower
-# note: Swyftx is not in CCXT; integrate later via their JWT API if needed.
+  - swyftx
+
+# conservative taker fee assumptions (bps)
+fees_bps:
+  kraken: 26
+  independentreserve: 50
+  btcmarkets: 35
+  okx: 10
+  coinspot: 100
+  swyftx: 100
