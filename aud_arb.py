@@ -55,7 +55,6 @@ class ExchangeClient:
         logger.info(f"[{self.id}] markets loaded: {len(self.symbol_map)}")
 
     async def load(self):
-        # Create instance with creds (if any)
         self.ex = self._new_instance(self._creds)
         try:
             await self._load_once()
@@ -64,17 +63,15 @@ class ExchangeClient:
             msg = str(e)
             if self.id == "okx" and self._creds:
                 logger.warning(f"[okx] load_markets failed with creds; retrying public-only. Error: {msg}")
-                # Close the failed instance before retrying to avoid leaked sessions
                 try:
                     await self.ex.close()
                 except Exception:
                     pass
-                self.ex = self._new_instance({})  # public-only
+                self.ex = self._new_instance({})
                 try:
                     await self._load_once()
                     return
                 except Exception as e2:
-                    # Close this instance as well; caller will drop the client
                     try:
                         await self.ex.close()
                     except Exception:
@@ -83,7 +80,6 @@ class ExchangeClient:
                     self.ex = None
                     return
             else:
-                # Close failed instance; caller will drop
                 try:
                     await self.ex.close()
                 except Exception:
@@ -91,7 +87,7 @@ class ExchangeClient:
                 logger.error(f"[{self.id}] load_markets error: {e}")
                 self.ex = None
 
-    async def fetch_tob(self, symbol: str, depth: int = 5) -> Optional[OrderBookTOB]:
+    async def fetch_tob(self, symbol: str, depth: int = 5):
         if self.needs_auth or not self.ex:
             return None
         if symbol not in self.symbol_map:
@@ -165,31 +161,40 @@ class ArbDetector:
                     "meets_threshold"
                 ])
 
-        # Build & probe each exchange individually; only keep loaded ones.
         for ex in self.exchange_ids:
             if ex == "swyftx":
-                token = self.swyftx_opts.get("token")
+                token = self.swyftx_opts.get("token", "")
+                api_key = self.swyftx_opts.get("api_key", "")
                 demo = self.swyftx_opts.get("demo") == "1"
-                if not token:
-                    logger.warning("[swyftx] SWYFTX_ACCESS_TOKEN missing; skipping")
+                refresh_url = self.swyftx_opts.get("refresh_url", "")
+                if not api_key and not token:
+                    logger.warning("[swyftx] missing SWYFTX_API_KEY and SWYFTX_ACCESS_TOKEN; skipping")
                     continue
-                swx = SwyftxExchangeClient(self.symbols, access_token=token, demo=demo)
+                swx = SwyftxExchangeClient(
+                    self.symbols,
+                    access_token=token,
+                    api_key=api_key,
+                    demo=demo,
+                    refresh_url=refresh_url,
+                )
                 await swx.load()
                 if swx.markets_loaded:
                     self.clients["swyftx"] = swx
                 else:
-                    # emit diagnostic to help you fix token or demo/prod mismatch
-                    logger.warning(f"[swyftx] token check failed; status={swx._last_status}, body_snippet={swx._last_body}")
+                    logger.warning(
+                        f"[swyftx] token check failed; "
+                        f"status={swx._last_status}, body_snippet={swx._last_body}, "
+                        f"refresh_status={swx._last_refresh_status}, refresh_body={swx._last_refresh_body}"
+                    )
                     await swx.close()
                 continue
 
-            # CCXT exchanges
             cc = ExchangeClient(ex, credentials=self.creds_by_ex.get(ex))
             await cc.load()
             if cc.markets_loaded:
                 self.clients[ex] = cc
             else:
-                await cc.close()  # ensure no leaked sessions
+                await cc.close()
                 logger.warning(f"Removing {ex}: failed to load markets or auth not satisfied")
 
         if not self.clients:
@@ -308,7 +313,9 @@ async def main():
 
     swyftx_opts = {
         "token": os.getenv("SWYFTX_ACCESS_TOKEN", ""),
+        "api_key": os.getenv("SWYFTX_API_KEY", ""),
         "demo": "1" if os.getenv("SWYFTX_DEMO", "0") == "1" else "0",
+        "refresh_url": os.getenv("SWYFTX_REFRESH_URL", "").strip(),
     }
 
     det = ArbDetector(
