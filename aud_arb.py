@@ -10,8 +10,9 @@ from dotenv import load_dotenv
 # CCXT async
 import ccxt.async_support as ccxt_async
 
-# Swyftx async adapter
+# Adapters
 from exchanges.swyftx_adapter import SwyftxExchangeClient
+from exchanges.okx_ws_adapter import OkxWSExchangeClient, OKX_PUBLIC_WS
 
 
 # ---------- Utils ----------
@@ -191,6 +192,37 @@ class ArbDetector:
                         await swx.close()
                     continue
 
+                if ex == "okx":
+                    # Prefer WS adapter; fallback to CCXT if no symbols or WS fails to start.
+                    use_ws = (os.getenv("OKX_WS_ENABLED", "1") == "1")
+                    if use_ws:
+                        channel = os.getenv("OKX_WS_ORDERBOOK_CHANNEL", "books5")
+                        okx_ws = OkxWSExchangeClient(
+                            symbols=self.symbols,
+                            channel=channel,
+                            api_key=self.creds_by_ex.get("okx", {}).get("apiKey") or "",
+                            api_secret=self.creds_by_ex.get("okx", {}).get("secret") or "",
+                            passphrase=self.creds_by_ex.get("okx", {}).get("password") or "",
+                            public_ws_url=os.getenv("OKX_WS_PUBLIC_URL", OKX_PUBLIC_WS),
+                            private_ws_url=os.getenv("OKX_WS_PRIVATE_URL", ""),
+                        )
+                        await okx_ws.load()
+                        if okx_ws.markets_loaded:
+                            self.clients["okx"] = okx_ws
+                            continue
+                        else:
+                            await okx_ws.close()
+                    # fallback: ccxt
+                    cc = ExchangeClient("okx", credentials=self.creds_by_ex.get("okx"))
+                    await cc.load()
+                    if cc.markets_loaded:
+                        self.clients["okx"] = cc
+                    else:
+                        await cc.close()
+                        logger.warning("Removing okx: failed to load markets or auth not satisfied")
+                    continue
+
+                # CCXT for other exchanges
                 cc = ExchangeClient(ex, credentials=self.creds_by_ex.get(ex))
                 await cc.load()
                 if cc.markets_loaded:
@@ -199,7 +231,6 @@ class ArbDetector:
                     await cc.close()
                     logger.warning(f"Removing {ex}: failed to load markets or auth not satisfied")
             except Exception as e:
-                # last-resort shield: do not crash setup on any one exchange
                 logger.error(f"[{ex}] setup error: {e}")
 
         if not self.clients:
@@ -210,12 +241,12 @@ class ArbDetector:
         interval = max(self.poll_ms, 100) / 1000.0
         while True:
             tob = None
-            if ex_id == "swyftx":
+            try:
                 d = await client.fetch_tob(symbol)
                 if d:
                     tob = OrderBookTOB(d["bid"], d["ask"], d["ts"])
-            else:
-                tob = await client.fetch_tob(symbol)
+            except Exception:
+                tob = None
             if tob:
                 self.state[symbol][ex_id] = tob
             await asyncio.sleep(interval)
