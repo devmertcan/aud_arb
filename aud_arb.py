@@ -29,7 +29,7 @@ def bps(x: float) -> float:
 class ExchangeClient:
     """
     Async ccxt wrapper for standard venues with an OKX public-retry.
-    Also special-cases CoinSpot to use fetch_ticker (public) for bid/ask.
+    Special-cases CoinSpot to use fetch_ticker for bid/ask (public) with OB fallback.
     """
     def __init__(self, ex_id: str, credentials: Optional[dict] = None):
         self.id = ex_id
@@ -92,7 +92,7 @@ class ExchangeClient:
     async def fetch_tob(self, symbol: str, depth: int = 5):
         """
         Return a dict: {"bid": float, "ask": float, "ts": float}
-        (Unified shape for all exchanges; avoids 'object is not subscriptable' issues.)
+        (Unified shape for all exchanges.)
         """
         if self.needs_auth or not self.ex:
             return None
@@ -138,7 +138,6 @@ class ExchangeClient:
             logger.debug(f"[{self.id}] {symbol} fetch_order_book err: {e}")
             return None
 
-
     async def close(self):
         if self.ex:
             try:
@@ -179,11 +178,11 @@ class ArbDetector:
 
         # diagnostics
         self._first_tick_logged: Set[Tuple[str, str]] = set()  # (ex_id, symbol)
+        self.enabled_symbols: Dict[str, List[str]] = {}
 
     async def setup(self):
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        # File logger at DEBUG for deep diagnostics
         logger.add(self.log_dir / "bot.log", rotation="10 MB", retention=10, level="DEBUG")
 
         if not self.csv_path.exists():
@@ -269,6 +268,34 @@ class ArbDetector:
         if not self.clients:
             raise RuntimeError("No exchanges available after setup()")
 
+        # ---- Auto-filter symbols per exchange (poll only what the venue actually lists)
+        self._compute_enabled_symbols()
+        self._emit_enabled_symbols_file()
+
+    def _compute_enabled_symbols(self):
+        enabled: Dict[str, List[str]] = {}
+        for ex_id, client in self.clients.items():
+            # client.symbol_map is set by each adapter/ccxt load()
+            listed = getattr(client, "symbol_map", set()) or set()
+            want = set(self.symbols)
+            have = sorted(list(want & set(listed)))
+            if not have:
+                logger.warning(f"[{ex_id}] No requested symbols listed on this venue; will skip polling.")
+            else:
+                logger.info(f"[{ex_id}] enabled symbols: {have}")
+            enabled[ex_id] = have
+        self.enabled_symbols = enabled
+
+    def _emit_enabled_symbols_file(self):
+        out = self.out_dir / f"enabled_symbols_{int(time.time())}.csv"
+        with out.open("w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["exchange", "symbol"])
+            for ex_id, syms in self.enabled_symbols.items():
+                for s in syms:
+                    w.writerow([ex_id, s])
+        logger.info(f"[SETUP] wrote enabled symbol map to {out}")
+
     async def _poll_exchange_symbol(self, ex_id: str, symbol: str):
         client = self.clients[ex_id]
         interval = max(self.poll_ms, 100) / 1000.0
@@ -339,7 +366,6 @@ class ArbDetector:
             if wrote == 0:
                 # emit a soft heartbeat to help diagnose why CSV is empty
                 diag = {s: len(self.state.get(s, {})) for s in self.symbols}
-                # show only symbols that have at least one venue, to keep logs readable
                 have_any = {s: n for s, n in diag.items() if n > 0}
                 if have_any:
                     logger.info(f"[HEALTH] venues per symbol (>=1 only): {have_any}")
@@ -361,9 +387,9 @@ class ArbDetector:
     async def run(self):
         tasks = []
         for ex_id, client in self.clients.items():
-            ex_symbols = [s for s in self.symbols if s in getattr(client, "symbol_map", set())]
+            ex_symbols = self.enabled_symbols.get(ex_id, [])
             if not ex_symbols:
-                logger.warning(f"[{ex_id}] No requested AUD symbols available; skipping")
+                logger.warning(f"[{ex_id}] No enabled symbols after auto-filter; skipping")
                 continue
             for s in ex_symbols:
                 tasks.append(asyncio.create_task(self._poll_exchange_symbol(ex_id, s)))
