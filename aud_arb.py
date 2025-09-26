@@ -161,41 +161,46 @@ class ArbDetector:
                     "meets_threshold"
                 ])
 
+        # Build & probe each exchange; failures don't crash the program.
         for ex in self.exchange_ids:
-            if ex == "swyftx":
-                token = self.swyftx_opts.get("token", "")
-                api_key = self.swyftx_opts.get("api_key", "")
-                demo = self.swyftx_opts.get("demo") == "1"
-                refresh_url = self.swyftx_opts.get("refresh_url", "")
-                if not api_key and not token:
-                    logger.warning("[swyftx] missing SWYFTX_API_KEY and SWYFTX_ACCESS_TOKEN; skipping")
-                    continue
-                swx = SwyftxExchangeClient(
-                    self.symbols,
-                    access_token=token,
-                    api_key=api_key,
-                    demo=demo,
-                    refresh_url=refresh_url,
-                )
-                await swx.load()
-                if swx.markets_loaded:
-                    self.clients["swyftx"] = swx
-                else:
-                    logger.warning(
-                        f"[swyftx] token check failed; "
-                        f"status={swx._last_status}, body_snippet={swx._last_body}, "
-                        f"refresh_status={swx._last_refresh_status}, refresh_body={swx._last_refresh_body}"
+            try:
+                if ex == "swyftx":
+                    token = self.swyftx_opts.get("token", "")
+                    api_key = self.swyftx_opts.get("api_key", "")
+                    demo = self.swyftx_opts.get("demo") == "1"
+                    refresh_url = self.swyftx_opts.get("refresh_url", "")
+                    if not api_key and not token:
+                        logger.warning("[swyftx] missing SWYFTX_API_KEY and SWYFTX_ACCESS_TOKEN; skipping")
+                        continue
+                    swx = SwyftxExchangeClient(
+                        self.symbols,
+                        access_token=token,
+                        api_key=api_key,
+                        demo=demo,
+                        refresh_url=refresh_url,
                     )
-                    await swx.close()
-                continue
+                    await swx.load()
+                    if swx.markets_loaded:
+                        self.clients["swyftx"] = swx
+                    else:
+                        logger.warning(
+                            f"[swyftx] token check failed; "
+                            f"status={swx._last_status}, body_snippet={swx._last_body}, "
+                            f"refresh_status={swx._last_refresh_status}, refresh_body={swx._last_refresh_body}"
+                        )
+                        await swx.close()
+                    continue
 
-            cc = ExchangeClient(ex, credentials=self.creds_by_ex.get(ex))
-            await cc.load()
-            if cc.markets_loaded:
-                self.clients[ex] = cc
-            else:
-                await cc.close()
-                logger.warning(f"Removing {ex}: failed to load markets or auth not satisfied")
+                cc = ExchangeClient(ex, credentials=self.creds_by_ex.get(ex))
+                await cc.load()
+                if cc.markets_loaded:
+                    self.clients[ex] = cc
+                else:
+                    await cc.close()
+                    logger.warning(f"Removing {ex}: failed to load markets or auth not satisfied")
+            except Exception as e:
+                # last-resort shield: do not crash setup on any one exchange
+                logger.error(f"[{ex}] setup error: {e}")
 
         if not self.clients:
             raise RuntimeError("No exchanges available after setup()")

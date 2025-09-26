@@ -28,16 +28,15 @@ class SwyftxAsyncClient:
 
         self._access_token = access_token or ""
         self._api_key = api_key or ""
+        # If set, use this absolute URL to refresh; otherwise default below.
         self._refresh_url_override = refresh_url_override.strip()
 
-        self._working_shape: Optional[int] = None  # price endpoint shape
+        self._working_shape: Optional[int] = None  # price endpoint shape idx
         self._refresh_lock = asyncio.Lock()
 
-        # ping diagnostics
+        # diagnostics
         self.last_ping_status: Optional[int] = None
         self.last_ping_body_snippet: Optional[str] = None
-
-        # refresh diagnostics
         self.last_refresh_status: Optional[int] = None
         self.last_refresh_body_snippet: Optional[str] = None
 
@@ -67,120 +66,58 @@ class SwyftxAsyncClient:
             await self._session.close()
 
     # ---------- token refresh ----------
+    def _default_refresh_url(self) -> str:
+        # Based on your screenshot: POST /auth/refresh/ with JSON {"apiKey": "..."}
+        return f"{self.base_url}/auth/refresh/"
+
     async def refresh_access_token(self) -> bool:
-        """Mint/rotate a new access token using API key. Tries multiple endpoint shapes."""
+        """Mint/rotate a new access token using API key."""
         if not self._api_key:
             self.last_refresh_status = None
             self.last_refresh_body_snippet = "No API key configured"
             return False
 
         async with self._refresh_lock:
-            # if another coroutine already refreshed while we waited, bail
-            if self._access_token and self.last_ping_status == 200:
-                return True
+            # use a fresh, short-lived session so we don't send stale Authorization
+            async with aiohttp.ClientSession(timeout=self.timeout, headers={
+                "Accept": "application/json",
+                "User-Agent": "aud-arb/1.0",
+                "Content-Type": "application/json",
+            }) as s:
+                url = self._refresh_url_override or self._default_refresh_url()
+                try:
+                    async with s.post(url, json={"apiKey": self._api_key}) as r:
+                        self.last_refresh_status = r.status
+                        try:
+                            txt = await r.text()
+                        except Exception:
+                            txt = ""
+                        self.last_refresh_body_snippet = (txt or "")[:200]
 
-            s = await self._session_get()
+                        if r.status not in (200, 201):
+                            return False
 
-            # explicit override (single attempt)
-            if self._refresh_url_override:
-                ok = await self._try_refresh_once(s, self._refresh_url_override)
-                return ok
+                        token = None
+                        try:
+                            js = await r.json()
+                        except Exception:
+                            js = None
+                        if isinstance(js, dict):
+                            for k in ("accessToken", "access_token", "jwt", "token"):
+                                if k in js and isinstance(js[k], str) and js[k]:
+                                    token = js[k]; break
+                        if not token:
+                            # last resort: try to pull a JWT-ish string from raw text
+                            import re
+                            m = re.search(r'eyJ[0-9A-Za-z_\-]+\.?[0-9A-Za-z_\-]*\.?[0-9A-Za-z_\-]*', txt or "")
+                            token = m.group(0) if m else None
+                        if not token:
+                            return False
 
-            # candidate endpoints and shapes (headers & bodies)
-            bases = [self.base_url]
-            paths = [
-                "/auth/refresh-access-token",
-                "/auth/refreshAccessToken",
-                "/auth/refresh",
-                "/auth/refresh_token",
-                "/auth/token/refresh",
-            ]
-
-            async def attempts():
-                # 1) Bearer <api_key>, POST no body
-                for b in bases:
-                    for p in paths:
-                        yield f"{b}{p}", {"Authorization": f"Bearer {self._api_key}"}, None, None
-                # 2) X-API-KEY header
-                for b in bases:
-                    for p in paths:
-                        yield f"{b}{p}", {"X-API-KEY": self._api_key}, None, None
-                # 3) JSON body {"apiKey": "..."}
-                for b in bases:
-                    for p in paths:
-                        yield f"{b}{p}", {}, {"apiKey": self._api_key}, "json"
-                # 4) form body apiKey=...
-                for b in bases:
-                    for p in paths:
-                        yield f"{b}{p}", {}, {"apiKey": self._api_key}, "form"
-
-            async for _ in _aiter(attempts()):
-                pass  # linter
-
-            for url, hdrs, body, kind in attempts():
-                ok = await self._try_refresh_once(s, url, hdrs, body, kind)
-                if ok:
-                    return True
-            return False
-
-    async def _try_refresh_once(
-        self,
-        session: aiohttp.ClientSession,
-        url: str,
-        extra_headers: Optional[Dict[str, str]] = None,
-        body: Optional[Dict[str, str]] = None,
-        body_kind: Optional[str] = None,  # "json" | "form" | None
-    ) -> bool:
-        try:
-            headers = dict(self._auth_headers())
-            if "Authorization" in headers:
-                headers.pop("Authorization", None)  # use api-key auth for refresh
-            if extra_headers:
-                headers.update(extra_headers)
-
-            if body_kind == "json":
-                async with session.post(url, headers=headers, json=body) as r:
-                    return await self._handle_refresh_response(r)
-            elif body_kind == "form":
-                async with session.post(url, headers=headers, data=body) as r:
-                    return await self._handle_refresh_response(r)
-            else:
-                async with session.post(url, headers=headers) as r:
-                    return await self._handle_refresh_response(r)
-        except Exception:
-            return False
-
-    async def _handle_refresh_response(self, r: aiohttp.ClientResponse) -> bool:
-        self.last_refresh_status = r.status
-        try:
-            txt = await r.text()
-        except Exception:
-            txt = ""
-        self.last_refresh_body_snippet = (txt or "")[:200]
-
-        if r.status not in (200, 201):
-            return False
-
-        # common token fields
-        token = None
-        try:
-            js = await r.json()
-        except Exception:
-            js = None
-        if isinstance(js, dict):
-            for k in ("access_token", "accessToken", "jwt", "token"):
-                if k in js and isinstance(js[k], str) and js[k]:
-                    token = js[k]
-                    break
-        if not token:
-            # try to extract from raw text if json fails
-            token = _extract_token_from_text(txt)
-
-        if not token:
-            return False
-
-        await self._reset_session_with_token(token)
-        return True
+                        await self._reset_session_with_token(token)
+                        return True
+                except Exception:
+                    return False
 
     # ---------- basic calls ----------
     async def ping_user(self) -> bool:
@@ -200,7 +137,7 @@ class SwyftxAsyncClient:
                         return True
                     if r.status in (401, 403) and self._api_key and attempt == 0:
                         if await self.refresh_access_token():
-                            s = await self._session_get()  # rebuilt with new token
+                            s = await self._session_get()
                             continue
                 return False
             except Exception:
@@ -211,6 +148,10 @@ class SwyftxAsyncClient:
                 return False
 
     async def get_bid_ask(self, base: str, quote: str) -> Optional[Tuple[float, float, float]]:
+        """
+        Query effective bid/ask (what you receive/pay).
+        Tries a couple of shapes and auto-refreshes token if needed.
+        """
         shapes = (
             ("/markets/price", {"primaryCurrencyCode": base, "secondaryCurrencyCode": quote}),
             ("/markets/price", {"primary_currency_code": base, "secondary_currency_code": quote}),
@@ -232,7 +173,7 @@ class SwyftxAsyncClient:
                         if r.status in (401, 403) and self._api_key and attempt == 0:
                             if await self.refresh_access_token():
                                 s = await self._session_get()
-                                break  # restart outer loop after refresh
+                                break  # refresh succeeded; restart outer loop
                         if r.status != 200:
                             continue
                         data = await r.json()
@@ -246,12 +187,16 @@ class SwyftxAsyncClient:
 
     @staticmethod
     def _extract_bid_ask(payload: Dict) -> Tuple[Optional[float], Optional[float]]:
+        """Normalize payload into (bid, ask)."""
         if not isinstance(payload, dict):
             return (None, None)
+
         if "ask" in payload and "bid" in payload:
             return float(payload["bid"]), float(payload["ask"])
         if "buy" in payload and "sell" in payload:
+            # buy = what you pay (ask), sell = what you receive (bid)
             return float(payload["sell"]), float(payload["buy"])
+
         for key in ("price", "data", "result"):
             obj = payload.get(key)
             if isinstance(obj, dict):
@@ -259,30 +204,20 @@ class SwyftxAsyncClient:
                     return float(obj["bid"]), float(obj["ask"])
                 if "buy" in obj and "sell" in obj:
                     return float(obj["sell"]), float(obj["buy"])
+
         for k in ("lastPrice", "last", "price"):
             if k in payload and isinstance(payload[k], (int, float)):
                 p = float(payload[k]); return p, p
+
         return (None, None)
-
-
-def _extract_token_from_text(txt: str) -> Optional[str]:
-    # super light heuristic (JWT-like or long bearer)
-    import re
-    m = re.search(r'eyJ[0-9A-Za-z_\-]+\.?[0-9A-Za-z_\-]*\.?[0-9A-Za-z_\-]*', txt)
-    if m:
-        return m.group(0)
-    m2 = re.search(r'"(access_token|accessToken|jwt|token)"\s*:\s*"([^"]+)"', txt)
-    if m2:
-        return m2.group(2)
-    return None
 
 
 class SwyftxExchangeClient:
     """
-    Looks like our CCXT ExchangeClient:
+    Wrapper to look like our CCXT ExchangeClient:
       - load(): sets markets_loaded (via token or token+refresh)
       - fetch_tob(): returns dict {'bid','ask','ts'}
-      - close(): closes aiohttp
+      - close(): closes aiohttp session
       - symbol_map: configured symbols
       - diagnostics exposed for logs
     """
@@ -304,7 +239,7 @@ class SwyftxExchangeClient:
         self._last_refresh_body = None
 
     async def load(self):
-        # If no seed token, try to mint one immediately
+        # If no seed token, try to mint one immediately using API key
         if not self.client._access_token and self.client._api_key:
             await self.client.refresh_access_token()
 
