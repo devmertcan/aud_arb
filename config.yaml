@@ -1,4 +1,5 @@
 # detection parameters (tweak anytime)
+max_trade_aud: 250
 min_profit_bps: 70         # 0.70% after fees/slippage
 slippage_bps: 10           # cushion for fills
 poll_ms: 500               # REST/Web poll cadence per symbol per exchange (ms)

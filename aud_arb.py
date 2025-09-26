@@ -17,9 +17,13 @@ from exchanges.okx_ws_adapter import OkxWSExchangeClient, OKX_PUBLIC_WS
 
 # ---------- Utils ----------
 class OrderBookTOB:
-    __slots__ = ("bid", "ask", "ts")
-    def __init__(self, bid: float, ask: float, ts: float):
-        self.bid, self.ask, self.ts = bid, ask, ts
+    """
+    Top-of-book snapshot with optional sizes.
+    bid/sell side size is base-amount at that level.
+    """
+    __slots__ = ("bid", "bid_qty", "ask", "ask_qty", "ts")
+    def __init__(self, bid: float, bid_qty: Optional[float], ask: float, ask_qty: Optional[float], ts: float):
+        self.bid, self.bid_qty, self.ask, self.ask_qty, self.ts = bid, bid_qty, ask, ask_qty, ts
 
 def bps(x: float) -> float:
     return x * 10000.0
@@ -29,7 +33,8 @@ def bps(x: float) -> float:
 class ExchangeClient:
     """
     Async ccxt wrapper for standard venues with an OKX public-retry.
-    Special-cases CoinSpot to use fetch_ticker for bid/ask (public) with OB fallback.
+    Special-cases CoinSpot to try fetch_ticker for bid/ask, then OB for sizes.
+    Always returns dict: {"bid","ask","bid_qty","ask_qty","ts"}
     """
     def __init__(self, ex_id: str, credentials: Optional[dict] = None):
         self.id = ex_id
@@ -91,49 +96,57 @@ class ExchangeClient:
 
     async def fetch_tob(self, symbol: str, depth: int = 5):
         """
-        Return a dict: {"bid": float, "ask": float, "ts": float}
-        (Unified shape for all exchanges.)
+        Return dict: {"bid": float, "ask": float, "bid_qty": Optional[float], "ask_qty": Optional[float], "ts": float}
         """
         if self.needs_auth or not self.ex:
             return None
         if symbol not in self.symbol_map:
             return None
         try:
-            # ---- CoinSpot: prefer fetch_ticker (public) for bid/ask
+            bid = ask = None
+            bid_qty = ask_qty = None
+
+            # ---- CoinSpot: prefer ticker for price; try OB for sizes if possible
             if self.id == "coinspot":
                 try:
                     tk = await self.ex.fetch_ticker(symbol)
                     bid = tk.get("bid"); ask = tk.get("ask")
-                    if bid is None or ask is None:
-                        ob = await self.ex.fetch_order_book(symbol, limit=depth)
-                        bids = ob.get("bids", []); asks = ob.get("asks", [])
-                        if not bids or not asks:
-                            return None
-                        bid = float(bids[0][0]); ask = float(asks[0][0])
-                    return {"bid": float(bid), "ask": float(ask), "ts": time.time()}
+                except Exception:
+                    pass
+                # Try OB for sizes (and fallback prices if ticker empty)
+                try:
+                    ob = await self.ex.fetch_order_book(symbol, limit=depth)
+                    bids = ob.get("bids", []); asks = ob.get("asks", [])
+                    if bids:
+                        if bid is None: bid = float(bids[0][0])
+                        bid_qty = float(bids[0][1])
+                    if asks:
+                        if ask is None: ask = float(asks[0][0])
+                        ask_qty = float(asks[0][1])
                 except Exception as e:
                     msg = str(e).lower()
                     if "api key" in msg or 'requires "apikey"' in msg:
                         self.needs_auth = True
-                        logger.warning("[coinspot] auth likely required for order book; add API key/secret")
-                        return None
-                    logger.debug(f"[coinspot] {symbol} ticker/orderbook err: {e}")
+                        logger.warning("[coinspot] auth likely required for order book; add API key/secret (sizes may be None)")
+                if bid is None or ask is None:
                     return None
+                return {"bid": float(bid), "ask": float(ask), "bid_qty": bid_qty, "ask_qty": ask_qty, "ts": time.time()}
 
-            # ---- all other venues: order book
+            # ---- all other venues: use OB
             ob = await self.ex.fetch_order_book(symbol, limit=depth)
-            bids = ob.get("bids", [])
-            asks = ob.get("asks", [])
+            bids = ob.get("bids", []); asks = ob.get("asks", [])
             if not bids or not asks:
                 return None
             bid = float(bids[0][0]); ask = float(asks[0][0])
-            return {"bid": bid, "ask": ask, "ts": time.time()}
+            bid_qty = float(bids[0][1]) if len(bids[0]) > 1 and bids[0][1] is not None else None
+            ask_qty = float(asks[0][1]) if len(asks[0]) > 1 and asks[0][1] is not None else None
+            return {"bid": bid, "ask": ask, "bid_qty": bid_qty, "ask_qty": ask_qty, "ts": time.time()}
 
         except Exception as e:
             msg = str(e).lower()
             if 'requires "apikey"' in msg or "requires api key" in msg or "api key" in msg:
                 self.needs_auth = True
-                logger.warning(f"[{self.id}] auth required for order book; add API key/secret in .env to enable")
+                logger.warning(f"[{self.id}] auth required for order book; add API key/secret in .env to enable (sizes may be None)")
                 return None
             logger.debug(f"[{self.id}] {symbol} fetch_order_book err: {e}")
             return None
@@ -160,6 +173,7 @@ class ArbDetector:
         log_dir: Path,
         creds_by_ex: Dict[str, dict],
         swyftx_opts: Dict[str, str],
+        max_trade_aud: float = 250.0,         # current cap (user param)
     ):
         self.symbols = symbols
         self.exchange_ids = exchange_ids
@@ -171,27 +185,42 @@ class ArbDetector:
         self.log_dir = log_dir
         self.creds_by_ex = creds_by_ex
         self.swyftx_opts = swyftx_opts
+        self.max_trade_aud = float(max_trade_aud)
 
         self.clients: Dict[str, object] = {}
         self.state: Dict[str, Dict[str, OrderBookTOB]] = {s: {} for s in symbols}
-        self.csv_path = out_dir / "tob_snapshots.csv"
+        self.snap_csv = out_dir / "tob_snapshots.csv"
+        self.opps_csv = out_dir / "opps_live.csv"
 
         # diagnostics
         self._first_tick_logged: Set[Tuple[str, str]] = set()  # (ex_id, symbol)
         self.enabled_symbols: Dict[str, List[str]] = {}
+        self._running_balance = 0.0  # cumulative expected PnL using max_trade_aud
 
     async def setup(self):
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         logger.add(self.log_dir / "bot.log", rotation="10 MB", retention=10, level="DEBUG")
 
-        if not self.csv_path.exists():
-            with self.csv_path.open("w", newline="") as f:
+        # main snapshots csv
+        if not self.snap_csv.exists():
+            with self.snap_csv.open("w", newline="") as f:
                 csv.writer(f).writerow([
                     "ts_iso","timestamp","symbol",
                     "buy_ex","buy_ask","sell_ex","sell_bid",
                     "gross_spread_bps","fees_bps","slippage_bps","net_spread_bps",
                     "meets_threshold"
+                ])
+
+        # opportunities csv (qualifying only)
+        if not self.opps_csv.exists():
+            with self.opps_csv.open("w", newline="") as f:
+                csv.writer(f).writerow([
+                    "ts_iso","symbol",
+                    "buy_ex","buy_ask","buy_ask_qty",
+                    "sell_ex","sell_bid","sell_bid_qty",
+                    "net_spread_bps","max_trade_size_aud",
+                    "qualifies_0p70","expected_profit_aud_at_cap","running_balance_aud"
                 ])
 
         # Build & probe each exchange; failures don't crash the program.
@@ -275,7 +304,6 @@ class ArbDetector:
     def _compute_enabled_symbols(self):
         enabled: Dict[str, List[str]] = {}
         for ex_id, client in self.clients.items():
-            # client.symbol_map is set by each adapter/ccxt load()
             listed = getattr(client, "symbol_map", set()) or set()
             want = set(self.symbols)
             have = sorted(list(want & set(listed)))
@@ -304,10 +332,15 @@ class ArbDetector:
             try:
                 d = await client.fetch_tob(symbol)
                 if d:
-                    tob = OrderBookTOB(d["bid"], d["ask"], d["ts"])
+                    tob = OrderBookTOB(
+                        d["bid"], d.get("bid_qty"),
+                        d["ask"], d.get("ask_qty"),
+                        d["ts"]
+                    )
                     if (ex_id, symbol) not in self._first_tick_logged:
                         self._first_tick_logged.add((ex_id, symbol))
-                        logger.info(f"[FIRST] {ex_id} {symbol} bid={tob.bid:.8f} ask={tob.ask:.8f}")
+                        logger.info(f"[FIRST] {ex_id} {symbol} bid={tob.bid:.8f} ask={tob.ask:.8f} "
+                                    f"(bid_qty={tob.bid_qty}, ask_qty={tob.ask_qty})")
             except Exception as e:
                 logger.debug(f"[{ex_id}] {symbol} polling error: {e}")
                 tob = None
@@ -324,13 +357,13 @@ class ArbDetector:
                 if len(books) < 2:
                     continue
 
-                best_sell_ex, best_sell_bid = None, -math.inf
-                best_buy_ex, best_buy_ask = None, math.inf
+                best_sell_ex, best_sell_bid, best_sell_qty = None, -math.inf, None
+                best_buy_ex, best_buy_ask, best_buy_qty = None, math.inf, None
                 for ex_id, tob in books.items():
                     if tob.bid > best_sell_bid:
-                        best_sell_ex, best_sell_bid = ex_id, tob.bid
+                        best_sell_ex, best_sell_bid, best_sell_qty = ex_id, tob.bid, tob.bid_qty
                     if tob.ask < best_buy_ask:
-                        best_buy_ex, best_buy_ask = ex_id, tob.ask
+                        best_buy_ex, best_buy_ask, best_buy_qty = ex_id, tob.ask, tob.ask_qty
                 if not best_buy_ex or not best_sell_ex or best_buy_ex == best_sell_ex:
                     continue
 
@@ -341,7 +374,8 @@ class ArbDetector:
                 net_bps = gross_bps - fees_total - self.slippage_bps
                 meets = int(net_bps >= self.min_profit_bps)
 
-                with self.csv_path.open("a", newline="") as f:
+                # --- write main snapshots row
+                with self.snap_csv.open("a", newline="") as f:
                     csv.writer(f).writerow([
                         pd.Timestamp.utcnow().isoformat(),
                         f"{now:.3f}",
@@ -356,11 +390,39 @@ class ArbDetector:
                     ])
                 wrote += 1
 
+                # --- if it qualifies, also write opps_live row (with sizes & PnL)
                 if meets:
+                    # compute TOB-constrained max AUD size if both sizes are present
+                    tob_max_aud = None
+                    if (best_buy_qty is not None) and (best_sell_qty is not None):
+                        try:
+                            tob_max_aud = min(best_buy_qty * best_buy_ask, best_sell_qty * best_sell_bid)
+                        except Exception:
+                            tob_max_aud = None
+
+                    # expected profit at configured cap (e.g., 250 AUD)
+                    expected_pnl_cap = self.max_trade_aud * (net_bps / 10000.0)
+                    self._running_balance += expected_pnl_cap
+
+                    with self.opps_csv.open("a", newline="") as f:
+                        csv.writer(f).writerow([
+                            pd.Timestamp.utcnow().isoformat(),
+                            symbol,
+                            best_buy_ex, f"{best_buy_ask:.8f}", (f"{best_buy_qty:.8f}" if best_buy_qty is not None else ""),
+                            best_sell_ex, f"{best_sell_bid:.8f}", (f"{best_sell_qty:.8f}" if best_sell_qty is not None else ""),
+                            f"{net_bps:.2f}",
+                            (f"{tob_max_aud:.2f}" if tob_max_aud is not None else f"{self.max_trade_aud:.2f}"),
+                            "YES",
+                            f"{expected_pnl_cap:.2f}",
+                            f"{self._running_balance:.2f}",
+                        ])
+
                     logger.info(
-                        f"[OPP] {symbol} buy {best_buy_ex}@{best_buy_ask:.4f} -> "
-                        f"sell {best_sell_ex}@{best_sell_bid:.4f} | net {net_bps:.1f} bps "
-                        f"(gross {gross_bps:.1f}, fees {fees_total}, slip {self.slippage_bps})"
+                        f"[OPP] {symbol} buy {best_buy_ex}@{best_buy_ask:.4f} "
+                        f"(qty {best_buy_qty}) -> sell {best_sell_ex}@{best_sell_bid:.4f} "
+                        f"(qty {best_sell_qty}) | net {net_bps:.1f} bps | "
+                        f"exp_pnl_at_{self.max_trade_aud:.0f}AUD={expected_pnl_cap:.2f} "
+                        f"(run={self._running_balance:.2f})"
                     )
 
             if wrote == 0:
@@ -374,7 +436,7 @@ class ArbDetector:
             await asyncio.sleep(1.0)
 
     async def _health_loop(self):
-        # extra periodic snapshot of which exchanges are updating
+        # periodic snapshot of which exchanges are updating
         while True:
             ex_counts: Dict[str, int] = {}
             for s, m in self.state.items():
@@ -452,6 +514,7 @@ async def main():
         log_dir=log_dir,
         creds_by_ex=creds,
         swyftx_opts=swyftx_opts,
+        max_trade_aud=float(cfg.get("max_trade_aud", 250.0)),  # NEW: uses your current cap
     )
 
     await det.setup()

@@ -7,7 +7,7 @@ import hashlib
 import hmac
 import json
 import time
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, Optional
 
 import aiohttp
 from loguru import logger
@@ -28,7 +28,8 @@ class OkxWSClient:
     OKX WebSocket v5 client for order book:
       - Channel: 'books5' (default) or 'books-l2-tbt'
       - Auto-reconnect + re-subscribe
-      - Optional private login (kept alive if creds provided)
+      - Optional private login
+    Stores: tob[instId] = (bid, bid_sz, ask, ask_sz, ts)
     """
 
     def __init__(
@@ -62,8 +63,8 @@ class OkxWSClient:
 
         self._stop = asyncio.Event()
 
-        # in-memory best bid/ask store: instId -> (bid, ask, ts)
-        self.tob: Dict[str, Tuple[float, float, float]] = {}
+        # in-memory best bid/ask + sizes: instId -> tuple
+        self.tob: Dict[str, tuple] = {}
 
         # tasks
         self._task_pub_main: Optional[asyncio.Task] = None
@@ -80,12 +81,11 @@ class OkxWSClient:
 
     async def close(self):
         self._stop.set()
-        try:
-            if self._task_pub_main: self._task_pub_main.cancel()
-            if self._task_priv_main: self._task_priv_main.cancel()
-        except Exception:
-            pass
-
+        for t in (self._task_pub_main, self._task_priv_main):
+            try:
+                if t: t.cancel()
+            except Exception:
+                pass
         try:
             if self._ws_pub and not self._ws_pub.closed:
                 await self._ws_pub.close()
@@ -103,7 +103,7 @@ class OkxWSClient:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=25.0),
-                headers={"User-Agent": "aud-arb/okx-ws/1.2", "Accept": "application/json"},
+                headers={"User-Agent": "aud-arb/okx-ws/1.3", "Accept": "application/json"},
             )
 
     async def _public_loop(self):
@@ -176,12 +176,14 @@ class OkxWSClient:
                     asks = entry.get("asks") or []
                     if not bids or not asks:
                         continue
-                    bid = float(bids[0][0]); ask = float(asks[0][0])
+                    # OKX entries: [price, size, liquidity?, ...]
+                    bid = float(bids[0][0]); bid_sz = float(bids[0][1])
+                    ask = float(asks[0][0]); ask_sz = float(asks[0][1])
                     ts = time.time()
-                    self.tob[instId] = (bid, ask, ts)
+                    self.tob[instId] = (bid, bid_sz, ask, ask_sz, ts)
                     if instId not in self._first_tick_logged:
                         self._first_tick_logged.add(instId)
-                        logger.info(f"[okx-ws:FIRST] {instId} bid={bid:.8f} ask={ask:.8f}")
+                        logger.info(f"[okx-ws:FIRST] {instId} bid={bid:.8f} ask={ask:.8f} (bid_sz={bid_sz}, ask_sz={ask_sz})")
                 except Exception:
                     continue
 
@@ -218,9 +220,13 @@ class OkxWSClient:
                 break
             if msg.type != aiohttp.WSMsgType.TEXT:
                 continue
-            # Swallow acks/heartbeats; for M2 add orders/balances subs.
+            # For M2: parse orders/balances if needed
+
 
 class OkxWSExchangeClient:
+    """
+    Thin adapter so the main bot can call .fetch_tob(symbol) and get dicts.
+    """
     def __init__(
         self,
         symbols: Iterable[str],
@@ -279,7 +285,7 @@ class OkxWSExchangeClient:
         try:
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=15.0),
-                headers={"User-Agent": "aud-arb/okx-rest/1.0", "Accept": "application/json"},
+                headers={"User-Agent": "aud-arb/okx-rest/1.1", "Accept": "application/json"},
             ) as s:
                 async with s.get(url) as r:
                     if r.status != 200:
@@ -296,8 +302,8 @@ class OkxWSExchangeClient:
         tup = self._client.tob.get(inst)
         if not tup:
             return None
-        bid, ask, ts = tup
-        return {"bid": float(bid), "ask": float(ask), "ts": ts}
+        bid, bid_sz, ask, ask_sz, ts = tup
+        return {"bid": float(bid), "ask": float(ask), "bid_qty": float(bid_sz), "ask_qty": float(ask_sz), "ts": ts}
 
     async def close(self):
         await self._client.close()
