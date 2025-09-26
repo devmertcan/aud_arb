@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import asyncio, os, sys, csv, time, math, signal
+import asyncio, os, csv, time, math, signal
 from pathlib import Path
 from typing import Dict, List, Optional
 from loguru import logger
@@ -14,7 +14,7 @@ import ccxt.async_support as ccxt_async
 from exchanges.swyftx_adapter import SwyftxExchangeClient
 
 
-# ========== Utility ==========
+# ---------- Utils ----------
 class OrderBookTOB:
     __slots__ = ("bid", "ask", "ts")
     def __init__(self, bid: float, ask: float, ts: float):
@@ -24,32 +24,58 @@ def bps(x: float) -> float:
     return x * 10000.0
 
 
-# ========== CCXT Exchange Client ==========
+# ---------- CCXT Exchange ----------
 class ExchangeClient:
     """
-    Async ccxt wrapper for standard venues.
+    Async ccxt wrapper for standard venues with an OKX public-retry.
     """
     def __init__(self, ex_id: str, credentials: Optional[dict] = None):
         self.id = ex_id
-        klass = getattr(ccxt_async, ex_id)
-        opts = {"enableRateLimit": True}
-        if credentials:
-            for k, v in credentials.items():
-                if v:
-                    opts[k] = v
-        self.ex = klass(opts)
+        self._klass = getattr(ccxt_async, ex_id)
+        self._creds = credentials or {}
+        self.ex = self._new_instance(self._creds)
         self.markets_loaded = False
         self.symbol_map = set()
         self.needs_auth = False
 
+    def _new_instance(self, creds: Dict):
+        # Always set enableRateLimit; set defaultType=spot for OKX to be explicit
+        opts = {"enableRateLimit": True}
+        if self.id == "okx":
+            opts["options"] = {"defaultType": "spot"}
+        # only attach non-empty creds
+        if creds:
+            for k, v in creds.items():
+                if v:
+                    opts[k] = v
+        return self._klass(opts)
+
     async def load(self):
-        try:
+        async def _try_load():
             await self.ex.load_markets()
             self.markets_loaded = True
             self.symbol_map = set(self.ex.markets.keys())
             logger.info(f"[{self.id}] markets loaded: {len(self.symbol_map)}")
+
+        try:
+            await _try_load()
         except Exception as e:
-            logger.error(f"[{self.id}] load_markets error: {e}")
+            # If OKX chokes on creds for public endpoints, retry without creds
+            msg = str(e)
+            if self.id == "okx" and self._creds:
+                logger.warning(f"[okx] load_markets failed with creds; retrying public-only. Error: {msg}")
+                try:
+                    await self.ex.close()
+                except Exception:
+                    pass
+                self.ex = self._new_instance({})  # no creds
+                try:
+                    await _try_load()
+                    return
+                except Exception as e2:
+                    logger.error(f"[okx] public-only load_markets failed: {e2}")
+            else:
+                logger.error(f"[{self.id}] load_markets error: {e}")
 
     async def fetch_tob(self, symbol: str, depth: int = 5) -> Optional[OrderBookTOB]:
         if self.needs_auth:
@@ -80,7 +106,7 @@ class ExchangeClient:
             pass
 
 
-# ========== Detector ==========
+# ---------- Detector ----------
 class ArbDetector:
     def __init__(
         self,
@@ -117,15 +143,14 @@ class ArbDetector:
 
         if not self.csv_path.exists():
             with self.csv_path.open("w", newline="") as f:
-                w = csv.writer(f)
-                w.writerow([
+                csv.writer(f).writerow([
                     "ts_iso","timestamp","symbol",
                     "buy_ex","buy_ask","sell_ex","sell_bid",
                     "gross_spread_bps","fees_bps","slippage_bps","net_spread_bps",
                     "meets_threshold"
                 ])
 
-        # build clients
+        # Build clients (create first, then load all concurrently)
         for ex in self.exchange_ids:
             if ex == "swyftx":
                 token = self.swyftx_opts.get("token")
@@ -133,26 +158,22 @@ class ArbDetector:
                 if not token:
                     logger.warning("[swyftx] SWYFTX_ACCESS_TOKEN missing; skipping")
                     continue
-                cli = SwyftxExchangeClient(self.symbols, access_token=token, demo=demo)
-                await cli.load()
-                if not cli.markets_loaded:
-                    logger.warning("[swyftx] token check failed; exchange disabled")
-                else:
-                    self.clients["swyftx"] = cli
-                continue
+                self.clients["swyftx"] = SwyftxExchangeClient(self.symbols, access_token=token, demo=demo)
+            else:
+                self.clients[ex] = ExchangeClient(ex, credentials=self.creds_by_ex.get(ex))
 
-            # ccxt path
-            self.clients[ex] = ExchangeClient(ex, credentials=self.creds_by_ex.get(ex))
-        # load ccxt markets concurrently
-        await asyncio.gather(*[
-            c.load() for eid, c in self.clients.items() if hasattr(c, "load") and eid != "swyftx"
-        ])
+        # Load concurrently
+        await asyncio.gather(*[c.load() for c in self.clients.values() if hasattr(c, "load")])
 
-        # drop any exchange that failed to load
+        # Remove failed & CLOSE them properly to avoid leaked sessions
         bad = [ex for ex, c in self.clients.items() if not getattr(c, "markets_loaded", False)]
         for ex in bad:
             logger.warning(f"Removing {ex}: failed to load markets or auth not satisfied")
-            del self.clients[ex]
+            try:
+                if hasattr(self.clients[ex], "close"):
+                    await self.clients[ex].close()
+            finally:
+                del self.clients[ex]
 
         if not self.clients:
             raise RuntimeError("No exchanges available after setup()")
@@ -163,10 +184,9 @@ class ArbDetector:
         while True:
             tob = None
             if ex_id == "swyftx":
-                tob = await client.fetch_tob(symbol)
-                if tob:
-                    # normalize to OrderBookTOB for internal state
-                    tob = OrderBookTOB(tob["bid"], tob["ask"], tob["ts"])
+                d = await client.fetch_tob(symbol)
+                if d:
+                    tob = OrderBookTOB(d["bid"], d["ask"], d["ts"])
             else:
                 tob = await client.fetch_tob(symbol)
             if tob:
@@ -199,8 +219,7 @@ class ArbDetector:
                 meets = int(net_bps >= self.min_profit_bps)
 
                 with self.csv_path.open("a", newline="") as f:
-                    w = csv.writer(f)
-                    w.writerow([
+                    csv.writer(f).writerow([
                         pd.Timestamp.utcnow().isoformat(),
                         f"{now:.3f}",
                         symbol,
@@ -224,7 +243,6 @@ class ArbDetector:
     async def run(self):
         tasks = []
         for ex_id, client in self.clients.items():
-            # list only symbols supported by this client
             ex_symbols = [s for s in self.symbols if s in getattr(client, "symbol_map", set())]
             if not ex_symbols:
                 logger.warning(f"[{ex_id}] No requested AUD symbols available; skipping")
@@ -246,13 +264,12 @@ class ArbDetector:
         [t.cancel() for t in tasks]; writer.cancel()
 
     async def close(self):
-        # Close ccxt and swyftx sessions
         await asyncio.gather(*[
             c.close() for c in self.clients.values() if hasattr(c, "close")
         ], return_exceptions=True)
 
 
-# ========== Entrypoint ==========
+# ---------- Entrypoint ----------
 def load_config(path: str) -> dict:
     with open(path, "r") as f:
         return yaml.safe_load(f)
@@ -264,29 +281,12 @@ async def main():
     out_dir = Path(cfg.get("out_dir", "./out"))
     log_dir = Path(cfg.get("log_dir", "./logs"))
 
-    # creds for ccxt exchanges
     creds = {
-        "coinspot": {
-            "apiKey": os.getenv("COINSPOT_API_KEY"),
-            "secret": os.getenv("COINSPOT_SECRET"),
-        },
-        "kraken": {
-            "apiKey": os.getenv("KRAKEN_API_KEY"),
-            "secret": os.getenv("KRAKEN_SECRET"),
-        },
-        "independentreserve": {
-            "apiKey": os.getenv("INDEPENDENTRESERVE_API_KEY"),
-            "secret": os.getenv("INDEPENDENTRESERVE_SECRET"),
-        },
-        "btcmarkets": {
-            "apiKey": os.getenv("BTCMARKETS_API_KEY"),
-            "secret": os.getenv("BTCMARKETS_SECRET"),
-        },
-        "okx": {
-            "apiKey": os.getenv("OKX_API_KEY"),
-            "secret": os.getenv("OKX_SECRET"),
-            "password": os.getenv("OKX_PASSPHRASE"),
-        },
+        "coinspot": {"apiKey": os.getenv("COINSPOT_API_KEY"), "secret": os.getenv("COINSPOT_SECRET")},
+        "kraken": {"apiKey": os.getenv("KRAKEN_API_KEY"), "secret": os.getenv("KRAKEN_SECRET")},
+        "independentreserve": {"apiKey": os.getenv("INDEPENDENTRESERVE_API_KEY"), "secret": os.getenv("INDEPENDENTRESERVE_SECRET")},
+        "btcmarkets": {"apiKey": os.getenv("BTCMARKETS_API_KEY"), "secret": os.getenv("BTCMARKETS_SECRET")},
+        "okx": {"apiKey": os.getenv("OKX_API_KEY"), "secret": os.getenv("OKX_SECRET"), "password": os.getenv("OKX_PASSPHRASE")},
     }
 
     swyftx_opts = {

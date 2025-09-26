@@ -1,29 +1,24 @@
 from __future__ import annotations
 import aiohttp
-import asyncio
 import time
 from typing import Optional, Tuple, Dict, Iterable
 
-
 DEFAULT_BASE = "https://api.swyftx.com.au"
 DEMO_BASE = "https://api.demo.swyftx.com.au"
-
 
 class SwyftxAsyncClient:
     """
     Minimal async client for Swyftx effective bid/ask.
     Auth: Bearer <ACCESS_TOKEN>
-    Endpoints tried in order (first that works sticks):
-      1) /markets/price?primaryCurrencyCode=BTC&secondaryCurrencyCode=AUD
-      2) /markets/price?primary_currency_code=BTC&secondary_currency_code=AUD
-      3) /markets/price/BTC/AUD
+    Tries multiple endpoint shapes to be resilient.
     """
     def __init__(self, access_token: str, base_url: str = DEFAULT_BASE, timeout: float = 4.0):
         self.base_url = base_url.rstrip("/")
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self._session: Optional[aiohttp.ClientSession] = None
         self._access_token = access_token
-        self._working_shape: Optional[int] = None  # 0,1,2 for the above variations
+        self._working_shape: Optional[int] = None  # 0,1,2 as below
+        self.last_ping_status: Optional[int] = None
 
     async def _session_get(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -42,12 +37,14 @@ class SwyftxAsyncClient:
             await self._session.close()
 
     async def ping_user(self) -> bool:
-        """Lightweight token sanity check."""
+        """Token sanity check."""
         try:
             s = await self._session_get()
             async with s.get(f"{self.base_url}/user") as r:
+                self.last_ping_status = r.status
                 return r.status == 200
         except Exception:
+            self.last_ping_status = None
             return False
 
     async def get_bid_ask(self, base: str, quote: str) -> Optional[Tuple[float, float, float]]:
@@ -58,8 +55,10 @@ class SwyftxAsyncClient:
         )
         s = await self._session_get()
 
-        # Prefer the last working shape to avoid multiple calls afterward.
-        order = [self._working_shape] + [i for i in range(len(shapes)) if i != self._working_shape] if self._working_shape is not None else range(len(shapes))
+        order = (
+            [self._working_shape] + [i for i in range(len(shapes)) if i != self._working_shape]
+            if self._working_shape is not None else range(len(shapes))
+        )
 
         for idx in order:
             path, params = shapes[idx]
@@ -79,18 +78,15 @@ class SwyftxAsyncClient:
 
     @staticmethod
     def _extract_bid_ask(payload: Dict) -> Tuple[Optional[float], Optional[float]]:
-        """Normalize a few likely shapes into (bid, ask)."""
+        """Normalize payload into (bid, ask)."""
         if not isinstance(payload, dict):
             return (None, None)
 
-        # flat keys
         if "ask" in payload and "bid" in payload:
             return float(payload["bid"]), float(payload["ask"])
         if "buy" in payload and "sell" in payload:
-            # buy = what you pay (ask), sell = what you receive (bid)
             return float(payload["sell"]), float(payload["buy"])
 
-        # nested common wrappers
         for key in ("price", "data", "result"):
             obj = payload.get(key)
             if isinstance(obj, dict):
@@ -99,22 +95,20 @@ class SwyftxAsyncClient:
                 if "buy" in obj and "sell" in obj:
                     return float(obj["sell"]), float(obj["buy"])
 
-        # fallback: last only
         for k in ("lastPrice", "last", "price"):
             if k in payload and isinstance(payload[k], (int, float)):
-                p = float(payload[k])
-                return p, p
+                p = float(payload[k]); return p, p
 
         return (None, None)
 
 
 class SwyftxExchangeClient:
     """
-    Thin wrapper to look like our CCXT ExchangeClient:
-      - load()         -> sets markets_loaded based on token check
-      - fetch_tob()    -> returns OrderBookTOB-like tuple
-      - close()
-      - symbol_map     -> set of supported symbols (we accept the configured list)
+    Looks like our CCXT ExchangeClient:
+      - load(): sets markets_loaded (via token check)
+      - fetch_tob(): returns dict {'bid','ask','ts'}
+      - close(): closes aiohttp
+      - symbol_map: configured symbols
     """
     def __init__(self, symbols: Iterable[str], access_token: str, demo: bool = False):
         self.id = "swyftx"
@@ -141,7 +135,6 @@ class SwyftxExchangeClient:
             if not res:
                 return None
             bid, ask, ts = res
-            # mirror our OrderBookTOB shape
             return {"bid": float(bid), "ask": float(ask), "ts": ts}
         except Exception:
             return None
