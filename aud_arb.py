@@ -90,6 +90,10 @@ class ExchangeClient:
                 self.ex = None
 
     async def fetch_tob(self, symbol: str, depth: int = 5):
+        """
+        Return a dict: {"bid": float, "ask": float, "ts": float}
+        (Unified shape for all exchanges; avoids 'object is not subscriptable' issues.)
+        """
         if self.needs_auth or not self.ex:
             return None
         if symbol not in self.symbol_map:
@@ -101,16 +105,15 @@ class ExchangeClient:
                     tk = await self.ex.fetch_ticker(symbol)
                     bid = tk.get("bid"); ask = tk.get("ask")
                     if bid is None or ask is None:
-                        # fallback OB if ticker didn’t include bid/ask
                         ob = await self.ex.fetch_order_book(symbol, limit=depth)
                         bids = ob.get("bids", []); asks = ob.get("asks", [])
                         if not bids or not asks:
                             return None
                         bid = float(bids[0][0]); ask = float(asks[0][0])
-                    return OrderBookTOB(float(bid), float(ask), time.time())
+                    return {"bid": float(bid), "ask": float(ask), "ts": time.time()}
                 except Exception as e:
                     msg = str(e).lower()
-                    if "api key" in msg or "requires \"apikey\"" in msg:
+                    if "api key" in msg or 'requires "apikey"' in msg:
                         self.needs_auth = True
                         logger.warning("[coinspot] auth likely required for order book; add API key/secret")
                         return None
@@ -124,7 +127,8 @@ class ExchangeClient:
             if not bids or not asks:
                 return None
             bid = float(bids[0][0]); ask = float(asks[0][0])
-            return OrderBookTOB(bid, ask, time.time())
+            return {"bid": bid, "ask": ask, "ts": time.time()}
+
         except Exception as e:
             msg = str(e).lower()
             if 'requires "apikey"' in msg or "requires api key" in msg or "api key" in msg:
@@ -133,6 +137,7 @@ class ExchangeClient:
                 return None
             logger.debug(f"[{self.id}] {symbol} fetch_order_book err: {e}")
             return None
+
 
     async def close(self):
         if self.ex:
