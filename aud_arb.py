@@ -33,52 +33,66 @@ class ExchangeClient:
         self.id = ex_id
         self._klass = getattr(ccxt_async, ex_id)
         self._creds = credentials or {}
-        self.ex = self._new_instance(self._creds)
+        self.ex = None  # create lazily
         self.markets_loaded = False
         self.symbol_map = set()
         self.needs_auth = False
 
     def _new_instance(self, creds: Dict):
-        # Always set enableRateLimit; set defaultType=spot for OKX to be explicit
         opts = {"enableRateLimit": True}
         if self.id == "okx":
             opts["options"] = {"defaultType": "spot"}
-        # only attach non-empty creds
         if creds:
             for k, v in creds.items():
                 if v:
                     opts[k] = v
         return self._klass(opts)
 
-    async def load(self):
-        async def _try_load():
-            await self.ex.load_markets()
-            self.markets_loaded = True
-            self.symbol_map = set(self.ex.markets.keys())
-            logger.info(f"[{self.id}] markets loaded: {len(self.symbol_map)}")
+    async def _load_once(self) -> None:
+        await self.ex.load_markets()
+        self.markets_loaded = True
+        self.symbol_map = set(self.ex.markets.keys())
+        logger.info(f"[{self.id}] markets loaded: {len(self.symbol_map)}")
 
+    async def load(self):
+        # Create instance with creds (if any)
+        self.ex = self._new_instance(self._creds)
         try:
-            await _try_load()
+            await self._load_once()
+            return
         except Exception as e:
-            # If OKX chokes on creds for public endpoints, retry without creds
             msg = str(e)
             if self.id == "okx" and self._creds:
                 logger.warning(f"[okx] load_markets failed with creds; retrying public-only. Error: {msg}")
+                # Close the failed instance before retrying to avoid leaked sessions
                 try:
                     await self.ex.close()
                 except Exception:
                     pass
-                self.ex = self._new_instance({})  # no creds
+                self.ex = self._new_instance({})  # public-only
                 try:
-                    await _try_load()
+                    await self._load_once()
                     return
                 except Exception as e2:
+                    # Close this instance as well; caller will drop the client
+                    try:
+                        await self.ex.close()
+                    except Exception:
+                        pass
                     logger.error(f"[okx] public-only load_markets failed: {e2}")
+                    self.ex = None
+                    return
             else:
+                # Close failed instance; caller will drop
+                try:
+                    await self.ex.close()
+                except Exception:
+                    pass
                 logger.error(f"[{self.id}] load_markets error: {e}")
+                self.ex = None
 
     async def fetch_tob(self, symbol: str, depth: int = 5) -> Optional[OrderBookTOB]:
-        if self.needs_auth:
+        if self.needs_auth or not self.ex:
             return None
         if symbol not in self.symbol_map:
             return None
@@ -100,10 +114,11 @@ class ExchangeClient:
             return None
 
     async def close(self):
-        try:
-            await self.ex.close()
-        except Exception:
-            pass
+        if self.ex:
+            try:
+                await self.ex.close()
+            except Exception:
+                pass
 
 
 # ---------- Detector ----------
@@ -150,7 +165,7 @@ class ArbDetector:
                     "meets_threshold"
                 ])
 
-        # Build clients (create first, then load all concurrently)
+        # Build & probe each exchange individually; only keep loaded ones.
         for ex in self.exchange_ids:
             if ex == "swyftx":
                 token = self.swyftx_opts.get("token")
@@ -158,22 +173,24 @@ class ArbDetector:
                 if not token:
                     logger.warning("[swyftx] SWYFTX_ACCESS_TOKEN missing; skipping")
                     continue
-                self.clients["swyftx"] = SwyftxExchangeClient(self.symbols, access_token=token, demo=demo)
+                swx = SwyftxExchangeClient(self.symbols, access_token=token, demo=demo)
+                await swx.load()
+                if swx.markets_loaded:
+                    self.clients["swyftx"] = swx
+                else:
+                    # emit diagnostic to help you fix token or demo/prod mismatch
+                    logger.warning(f"[swyftx] token check failed; status={swx._last_status}, body_snippet={swx._last_body}")
+                    await swx.close()
+                continue
+
+            # CCXT exchanges
+            cc = ExchangeClient(ex, credentials=self.creds_by_ex.get(ex))
+            await cc.load()
+            if cc.markets_loaded:
+                self.clients[ex] = cc
             else:
-                self.clients[ex] = ExchangeClient(ex, credentials=self.creds_by_ex.get(ex))
-
-        # Load concurrently
-        await asyncio.gather(*[c.load() for c in self.clients.values() if hasattr(c, "load")])
-
-        # Remove failed & CLOSE them properly to avoid leaked sessions
-        bad = [ex for ex, c in self.clients.items() if not getattr(c, "markets_loaded", False)]
-        for ex in bad:
-            logger.warning(f"Removing {ex}: failed to load markets or auth not satisfied")
-            try:
-                if hasattr(self.clients[ex], "close"):
-                    await self.clients[ex].close()
-            finally:
-                del self.clients[ex]
+                await cc.close()  # ensure no leaked sessions
+                logger.warning(f"Removing {ex}: failed to load markets or auth not satisfied")
 
         if not self.clients:
             raise RuntimeError("No exchanges available after setup()")

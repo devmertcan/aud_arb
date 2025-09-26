@@ -12,13 +12,14 @@ class SwyftxAsyncClient:
     Auth: Bearer <ACCESS_TOKEN>
     Tries multiple endpoint shapes to be resilient.
     """
-    def __init__(self, access_token: str, base_url: str = DEFAULT_BASE, timeout: float = 4.0):
+    def __init__(self, access_token: str, base_url: str = DEFAULT_BASE, timeout: float = 4.5):
         self.base_url = base_url.rstrip("/")
         self.timeout = aiohttp.ClientTimeout(total=timeout)
         self._session: Optional[aiohttp.ClientSession] = None
         self._access_token = access_token
         self._working_shape: Optional[int] = None  # 0,1,2 as below
         self.last_ping_status: Optional[int] = None
+        self.last_ping_body_snippet: Optional[str] = None
 
     async def _session_get(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -37,14 +38,20 @@ class SwyftxAsyncClient:
             await self._session.close()
 
     async def ping_user(self) -> bool:
-        """Token sanity check."""
+        """Token sanity check with status/body snippet for diagnostics."""
         try:
             s = await self._session_get()
             async with s.get(f"{self.base_url}/user") as r:
                 self.last_ping_status = r.status
+                try:
+                    txt = await r.text()
+                except Exception:
+                    txt = ""
+                self.last_ping_body_snippet = (txt or "")[:160]
                 return r.status == 200
         except Exception:
             self.last_ping_status = None
+            self.last_ping_body_snippet = None
             return False
 
     async def get_bid_ask(self, base: str, quote: str) -> Optional[Tuple[float, float, float]]:
@@ -117,9 +124,14 @@ class SwyftxExchangeClient:
         self.symbol_map = set(symbols)
         self.markets_loaded = False
         self.needs_auth = False
+        # For debug visibility (read by caller after load())
+        self._last_status = None
+        self._last_body = None
 
     async def load(self):
         ok = await self.client.ping_user()
+        self._last_status = self.client.last_ping_status
+        self._last_body = self.client.last_ping_body_snippet
         if not ok:
             self.needs_auth = True
             self.markets_loaded = False
