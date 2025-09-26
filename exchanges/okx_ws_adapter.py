@@ -10,7 +10,7 @@ import time
 from typing import Dict, Iterable, Optional, Tuple
 
 import aiohttp
-
+from loguru import logger
 
 OKX_PUBLIC_WS = "wss://ws.okx.com:8443/ws/v5/public"
 OKX_PRIVATE_WS = "wss://ws.okx.com:8443/ws/v5/private"
@@ -18,10 +18,6 @@ OKX_REST_BASE = "https://www.okx.com"
 
 
 def _okx_sign(secret: str, ts: str, method: str, path: str, body: str = "") -> str:
-    """
-    Per OKX v5: sign Base64(HMAC_SHA256(secret, ts + method + path + body))
-    Login verifies against GET /users/self/verify
-    """
     prehash = f"{ts}{method}{path}{body}".encode()
     digest = hmac.new(secret.encode(), prehash, hashlib.sha256).digest()
     return base64.b64encode(digest).decode()
@@ -29,15 +25,15 @@ def _okx_sign(secret: str, ts: str, method: str, path: str, body: str = "") -> s
 
 class OkxWSClient:
     """
-    Minimal OKX WebSocket v5 client for spot order book:
-      - Channel: 'books5' (default) or 'books-l2-tbt' (set in env OKX_WS_ORDERBOOK_CHANNEL)
+    OKX WebSocket v5 client for order book:
+      - Channel: 'books5' (default) or 'books-l2-tbt'
       - Auto-reconnect + re-subscribe
-      - Optional private login (kept connected if creds provided)
+      - Optional private login (kept alive if creds provided)
     """
 
     def __init__(
         self,
-        instruments: Iterable[str],                 # instIds like "BTC-AUD"
+        instruments: Iterable[str],
         channel: str = "books5",
         api_key: str = "",
         api_secret: str = "",
@@ -73,12 +69,12 @@ class OkxWSClient:
         self._task_pub_main: Optional[asyncio.Task] = None
         self._task_priv_main: Optional[asyncio.Task] = None
 
-    # -------- lifecycle --------
+        # diagnostics
+        self._first_tick_logged: set[str] = set()
+
     async def start(self):
         await self._ensure_session()
-        # spawn public loop
         self._task_pub_main = asyncio.create_task(self._public_loop(), name="okx_pub_main")
-        # spawn private login loop if creds are present (keeps a logged-in socket for M2)
         if self.api_key and self.api_secret and self.passphrase:
             self._task_priv_main = asyncio.create_task(self._private_loop(), name="okx_priv_main")
 
@@ -107,26 +103,23 @@ class OkxWSClient:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=25.0),
-                headers={"User-Agent": "aud-arb/okx-ws/1.1", "Accept": "application/json"},
+                headers={"User-Agent": "aud-arb/okx-ws/1.2", "Accept": "application/json"},
             )
 
-    # -------- public loop (reconnect + subscribe) --------
     async def _public_loop(self):
         args = [{"channel": self.channel, "instId": inst} for inst in self.inst_ids]
         while not self._stop.is_set():
             try:
                 await self._ensure_session()
                 self._ws_pub = await self._session.ws_connect(self.public_ws_url, heartbeat=None, timeout=self._connect_timeout)
-                # subscribe
                 await self._ws_pub.send_json({"op": "subscribe", "args": args})
-                # run reader & pinger until one dies
+                logger.info(f"[okx-ws] subscribed channel={self.channel} instIds={','.join([a['instId'] for a in args])}")
                 reader = asyncio.create_task(self._reader_loop_public(self._ws_pub), name="okx_pub_reader")
                 pinger = asyncio.create_task(self._pinger_loop(self._ws_pub), name="okx_pub_pinger")
                 done, pending = await asyncio.wait({reader, pinger}, return_when=asyncio.FIRST_COMPLETED)
                 for t in pending: t.cancel()
-            except Exception:
-                pass
-            # close & retry
+            except Exception as e:
+                logger.debug(f"[okx-ws] public loop error: {e}")
             try:
                 if self._ws_pub and not self._ws_pub.closed:
                     await self._ws_pub.close()
@@ -163,7 +156,7 @@ class OkxWSClient:
                 continue
 
             if isinstance(payload, dict):
-                if payload.get("event") in ("subscribe", "unsubscribe", "login"):  # acks
+                if payload.get("event") in ("subscribe", "unsubscribe", "login"):
                     continue
                 if payload.get("op") == "pong":
                     continue
@@ -177,7 +170,6 @@ class OkxWSClient:
                 if not instId or not data:
                     continue
 
-                # books5 / books-l2-tbt format: take top level
                 try:
                     entry = data[0]
                     bids = entry.get("bids") or []
@@ -187,27 +179,27 @@ class OkxWSClient:
                     bid = float(bids[0][0]); ask = float(asks[0][0])
                     ts = time.time()
                     self.tob[instId] = (bid, ask, ts)
+                    if instId not in self._first_tick_logged:
+                        self._first_tick_logged.add(instId)
+                        logger.info(f"[okx-ws:FIRST] {instId} bid={bid:.8f} ask={ask:.8f}")
                 except Exception:
                     continue
 
-    # -------- private socket (optional; keeps login alive) --------
     async def _private_loop(self):
         while not self._stop.is_set():
             try:
                 await self._ensure_session()
                 self._ws_priv = await self._session.ws_connect(self.private_ws_url, heartbeat=None, timeout=self._connect_timeout)
-                # login
                 ts = str(round(time.time()))
                 sign = _okx_sign(self.api_secret, ts, "GET", "/users/self/verify")
                 login_args = [{"apiKey": self.api_key, "passphrase": self.passphrase, "timestamp": ts, "sign": sign}]
                 await self._ws_priv.send_json({"op": "login", "args": login_args})
-                # keep the socket alive (no subs yet)
                 reader = asyncio.create_task(self._reader_loop_private(self._ws_priv), name="okx_priv_reader")
                 pinger = asyncio.create_task(self._pinger_loop(self._ws_priv), name="okx_priv_pinger")
                 done, pending = await asyncio.wait({reader, pinger}, return_when=asyncio.FIRST_COMPLETED)
                 for t in pending: t.cancel()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"[okx-ws] private loop error: {e}")
             try:
                 if self._ws_priv and not self._ws_priv.closed:
                     await self._ws_priv.close()
@@ -226,21 +218,9 @@ class OkxWSClient:
                 break
             if msg.type != aiohttp.WSMsgType.TEXT:
                 continue
-            # For now, we just swallow acks/heartbeats;
-            # when you need balances/orders (M2), add channel subs here.
+            # Swallow acks/heartbeats; for M2 add orders/balances subs.
 
 class OkxWSExchangeClient:
-    """
-    Exchange wrapper exposing:
-      - load(): resolves requested symbols -> OKX instIds (via REST instruments), starts WS
-      - fetch_tob(symbol): returns {'bid','ask','ts'} from websocket cache
-      - close(): closes sockets/session
-
-    Symbol mapping:
-      - Input symbols are "BASE/QUOTE" (e.g., "BTC/AUD")
-      - Map to OKX instId "BASE-QUOTE" if present in SPOT instruments.
-    """
-
     def __init__(
         self,
         symbols: Iterable[str],
@@ -254,7 +234,7 @@ class OkxWSExchangeClient:
     ):
         self.id = "okx"
         self._symbols_req = list(symbols)
-        self.symbol_map = set()              # supported "BASE/QUOTE"
+        self.symbol_map = set()
         self._symbol_to_inst: Dict[str, str] = {}
         self._inst_to_symbol: Dict[str, str] = {}
         self.markets_loaded = False
@@ -289,10 +269,7 @@ class OkxWSExchangeClient:
                 self._inst_to_symbol[inst] = sym
                 self.symbol_map.add(sym)
 
-        # If none of the requested AUD pairs exist on OKX, we still count as loaded,
-        # but there will be 0 symbols to poll for OKX.
         self.markets_loaded = True
-
         if self.symbol_map:
             self._client.inst_ids = list(self._inst_to_symbol.keys())
             await self._client.start()

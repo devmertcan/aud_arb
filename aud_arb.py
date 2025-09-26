@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import asyncio, os, csv, time, math, signal
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 from loguru import logger
 import yaml
 import pandas as pd
@@ -29,6 +29,7 @@ def bps(x: float) -> float:
 class ExchangeClient:
     """
     Async ccxt wrapper for standard venues with an OKX public-retry.
+    Also special-cases CoinSpot to use fetch_ticker (public) for bid/ask.
     """
     def __init__(self, ex_id: str, credentials: Optional[dict] = None):
         self.id = ex_id
@@ -94,6 +95,29 @@ class ExchangeClient:
         if symbol not in self.symbol_map:
             return None
         try:
+            # ---- CoinSpot: prefer fetch_ticker (public) for bid/ask
+            if self.id == "coinspot":
+                try:
+                    tk = await self.ex.fetch_ticker(symbol)
+                    bid = tk.get("bid"); ask = tk.get("ask")
+                    if bid is None or ask is None:
+                        # fallback OB if ticker didn’t include bid/ask
+                        ob = await self.ex.fetch_order_book(symbol, limit=depth)
+                        bids = ob.get("bids", []); asks = ob.get("asks", [])
+                        if not bids or not asks:
+                            return None
+                        bid = float(bids[0][0]); ask = float(asks[0][0])
+                    return OrderBookTOB(float(bid), float(ask), time.time())
+                except Exception as e:
+                    msg = str(e).lower()
+                    if "api key" in msg or "requires \"apikey\"" in msg:
+                        self.needs_auth = True
+                        logger.warning("[coinspot] auth likely required for order book; add API key/secret")
+                        return None
+                    logger.debug(f"[coinspot] {symbol} ticker/orderbook err: {e}")
+                    return None
+
+            # ---- all other venues: order book
             ob = await self.ex.fetch_order_book(symbol, limit=depth)
             bids = ob.get("bids", [])
             asks = ob.get("asks", [])
@@ -148,10 +172,14 @@ class ArbDetector:
         self.state: Dict[str, Dict[str, OrderBookTOB]] = {s: {} for s in symbols}
         self.csv_path = out_dir / "tob_snapshots.csv"
 
+        # diagnostics
+        self._first_tick_logged: Set[Tuple[str, str]] = set()  # (ex_id, symbol)
+
     async def setup(self):
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        logger.add(self.log_dir / "bot.log", rotation="10 MB", retention=10)
+        # File logger at DEBUG for deep diagnostics
+        logger.add(self.log_dir / "bot.log", rotation="10 MB", retention=10, level="DEBUG")
 
         if not self.csv_path.exists():
             with self.csv_path.open("w", newline="") as f:
@@ -193,7 +221,7 @@ class ArbDetector:
                     continue
 
                 if ex == "okx":
-                    # Prefer WS adapter; fallback to CCXT if no symbols or WS fails to start.
+                    # Prefer WS adapter; fallback to CCXT if WS yields 0 symbols.
                     use_ws = (os.getenv("OKX_WS_ENABLED", "1") == "1")
                     if use_ws:
                         channel = os.getenv("OKX_WS_ORDERBOOK_CHANNEL", "books5")
@@ -245,7 +273,11 @@ class ArbDetector:
                 d = await client.fetch_tob(symbol)
                 if d:
                     tob = OrderBookTOB(d["bid"], d["ask"], d["ts"])
-            except Exception:
+                    if (ex_id, symbol) not in self._first_tick_logged:
+                        self._first_tick_logged.add((ex_id, symbol))
+                        logger.info(f"[FIRST] {ex_id} {symbol} bid={tob.bid:.8f} ask={tob.ask:.8f}")
+            except Exception as e:
+                logger.debug(f"[{ex_id}] {symbol} polling error: {e}")
                 tob = None
             if tob:
                 self.state[symbol][ex_id] = tob
@@ -254,6 +286,7 @@ class ArbDetector:
     async def _writer_loop(self):
         while True:
             now = time.time()
+            wrote = 0
             for symbol in self.symbols:
                 books = self.state.get(symbol, {})
                 if len(books) < 2:
@@ -289,14 +322,36 @@ class ArbDetector:
                         f"{net_bps:.2f}",
                         meets
                     ])
+                wrote += 1
 
                 if meets:
                     logger.info(
-                        f"[OPP] {symbol} buy {best_buy_ex}@{best_buy_ask:.2f} -> "
-                        f"sell {best_sell_ex}@{best_sell_bid:.2f} | net {net_bps:.1f} bps "
+                        f"[OPP] {symbol} buy {best_buy_ex}@{best_buy_ask:.4f} -> "
+                        f"sell {best_sell_ex}@{best_sell_bid:.4f} | net {net_bps:.1f} bps "
                         f"(gross {gross_bps:.1f}, fees {fees_total}, slip {self.slippage_bps})"
                     )
-            await asyncio.sleep(0.2)
+
+            if wrote == 0:
+                # emit a soft heartbeat to help diagnose why CSV is empty
+                diag = {s: len(self.state.get(s, {})) for s in self.symbols}
+                # show only symbols that have at least one venue, to keep logs readable
+                have_any = {s: n for s, n in diag.items() if n > 0}
+                if have_any:
+                    logger.info(f"[HEALTH] venues per symbol (>=1 only): {have_any}")
+                else:
+                    logger.info("[HEALTH] no venues delivering TOB yet; waiting for first ticks...")
+            await asyncio.sleep(1.0)
+
+    async def _health_loop(self):
+        # extra periodic snapshot of which exchanges are updating
+        while True:
+            ex_counts: Dict[str, int] = {}
+            for s, m in self.state.items():
+                for ex_id in m.keys():
+                    ex_counts[ex_id] = ex_counts.get(ex_id, 0) + 1
+            if ex_counts:
+                logger.info(f"[HEALTH] per-exchange symbol coverage: {ex_counts}")
+            await asyncio.sleep(15)
 
     async def run(self):
         tasks = []
@@ -313,13 +368,14 @@ class ArbDetector:
             raise RuntimeError("No symbols to poll across all exchanges")
 
         writer = asyncio.create_task(self._writer_loop())
+        health = asyncio.create_task(self._health_loop())
 
         stop = asyncio.Future()
         for sig in (signal.SIGINT, signal.SIGTERM):
             asyncio.get_running_loop().add_signal_handler(sig, lambda s=sig: stop.set_result(True))
         await stop
 
-        [t.cancel() for t in tasks]; writer.cancel()
+        [t.cancel() for t in tasks]; writer.cancel(); health.cancel()
 
     async def close(self):
         await asyncio.gather(*[

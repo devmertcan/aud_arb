@@ -38,3 +38,16 @@ For background service, use `systemd` (see `USAGE.md`).
 ## Outputs
 - Logs → `/opt/aud_arb/logs/bot.log`
 - CSV snapshots → `/opt/aud_arb/out/tob_snapshots.csv`
+
+
+cd /opt/aud_arb
+source .venv/bin/activate
+
+# For a single UTC day (e.g., today UTC):
+python tools/daily_report.py --csv ./out/tob_snapshots.csv --date 2025-09-26
+
+# For a date range (inclusive of whole days):
+python tools/daily_report.py --csv ./out/tob_snapshots.csv --start 2025-09-24 --end 2025-09-26
+
+# Put outputs in a custom folder and show top 15 pairs:
+python tools/daily_report.py --outdir ./out/reports --topn 15

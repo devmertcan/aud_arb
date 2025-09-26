@@ -1,247 +1,297 @@
 #!/usr/bin/env python3
 """
-Daily report generator for AUD arbitrage detection.
+Daily arbitrage report for aud_arb.
 
-Reads the master CSV (e.g., /opt/aud_arb/out/tob_snapshots.csv),
-filters by a date (default: yesterday, in UTC), computes summary stats,
-creates plots, and bundles everything into a ZIP you can send to the client.
+Reads /opt/aud_arb/out/tob_snapshots.csv (or a custom path) and produces:
+- summary_<DATE>.csv    (key metrics and top lists in tidy format)
+- plot_timeseries_<DATE>.png  (minute-averaged net spread over time; all symbols)
+- plot_hist_<DATE>.png        (distribution of net spread; meets_threshold=1)
+- plot_top_pairs_<DATE>.png   (top symbols by opp count; meets_threshold=1)
 
-Outputs (in --out-dir):
-  - daily_clean.csv
-  - spread_over_time.png
-  - top_pairs_bar.png
-  - summary_stats.txt
-  - aud_arb_daily_<YYYY-MM-DD>.zip
-
-Usage:
-  python tools/daily_report.py \
-    --csv /opt/aud_arb/out/tob_snapshots.csv \
-    --out-dir /opt/aud_arb/reports \
-    --date 2025-09-22 \
-    --threshold-after-fee 0.7
+Usage examples:
+  python tools/daily_report.py --csv ./out/tob_snapshots.csv --date 2025-09-26
+  python tools/daily_report.py --csv ./out/tob_snapshots.csv --start 2025-09-24 --end 2025-09-26
+  python tools/daily_report.py --outdir ./out/reports
 """
 
 import argparse
-import io
 import os
+from pathlib import Path
 import sys
-import zipfile
-from datetime import datetime, timedelta, timezone
-
+import warnings
 import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")  # headless
 import matplotlib.pyplot as plt
 
+
 def parse_args():
-    ap = argparse.ArgumentParser(description="Generate daily report zip from detection CSV.")
-    ap.add_argument("--csv", required=True, help="Path to master CSV (e.g., /opt/aud_arb/out/tob_snapshots.csv)")
-    ap.add_argument("--out-dir", required=True, help="Directory to write outputs/ZIP")
-    ap.add_argument("--date", default=None, help="Target date in YYYY-MM-DD (UTC). Default: yesterday")
-    ap.add_argument("--threshold-after-fee", type=float, default=0.7,
-                    help="Profit threshold in percent (after fees) to count as opportunity.")
-    ap.add_argument("--timezone", default="UTC",
-                    help="Info only; timestamps in CSV assumed ISO UTC. Reports are labeled with this TZ name.")
-    return ap.parse_args()
+    p = argparse.ArgumentParser(description="Summarize daily AUD arb snapshots and plot quick charts.")
+    p.add_argument("--csv", default="./out/tob_snapshots.csv", help="Path to tob_snapshots.csv")
+    p.add_argument("--outdir", default="./out/reports", help="Directory to write summary & plots")
+    # choose either --date (single UTC day) OR [--start, --end] inclusive bounds
+    p.add_argument("--date", help="UTC date (YYYY-MM-DD) to include")
+    p.add_argument("--start", help="UTC start date (YYYY-MM-DD), inclusive")
+    p.add_argument("--end", help="UTC end date (YYYY-MM-DD), inclusive")
+    p.add_argument("--topn", type=int, default=10, help="How many top pairs/routes to include in plots")
+    p.add_argument("--resample", default="1min", help="Timeseries resample freq (e.g., 30s, 1min, 5min)")
+    return p.parse_args()
 
-def _safe_parse_ts(s: str):
-    try:
-        # Expecting ISO UTC, eg "2025-09-19T01:40:51.521000Z"
-        # pandas can parse; fall back to None on weird rows.
-        return pd.to_datetime(s, utc=True)
-    except Exception:
-        return pd.NaT
 
-def load_and_filter(csv_path: str, target_date_utc: datetime) -> pd.DataFrame:
-    # Read CSV; columns expected from CSVReporter:
-    # timestamp_iso, exchange_buy, exchange_sell, pair, best_ask_buy_ex, best_bid_sell_ex,
-    # spread_aud, spread_pct, after_fee_spread_pct, notional_aud, confidence, reason
-    df = pd.read_csv(csv_path)
-    if "timestamp_iso" not in df.columns:
-        raise RuntimeError("CSV missing 'timestamp_iso' column.")
+NUMERIC_COLS = [
+    "timestamp",
+    "buy_ask",
+    "sell_bid",
+    "gross_spread_bps",
+    "fees_bps",
+    "slippage_bps",
+    "net_spread_bps",
+    "meets_threshold",
+]
 
-    # Parse timestamps; drop rows with invalid timestamps
-    ts = df["timestamp_iso"].astype(str).apply(_safe_parse_ts)
-    df = df.assign(timestamp=ts).dropna(subset=["timestamp"])
 
-    # Filter by UTC day
-    start = target_date_utc.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
-    end = start + timedelta(days=1)
-    mask = (df["timestamp"] >= start) & (df["timestamp"] < end)
-    return df.loc[mask].copy()
+def load_df(csv_path: Path) -> pd.DataFrame:
+    if not csv_path.exists():
+        print(f"ERROR: CSV not found: {csv_path}", file=sys.stderr)
+        sys.exit(1)
+    # be robust to partial writes
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        df = pd.read_csv(csv_path)
+    expected_cols = [
+        "ts_iso","timestamp","symbol",
+        "buy_ex","buy_ask","sell_ex","sell_bid",
+        "gross_spread_bps","fees_bps","slippage_bps","net_spread_bps","meets_threshold"
+    ]
+    missing = [c for c in expected_cols if c not in df.columns]
+    if missing:
+        print(f"ERROR: CSV missing expected columns: {missing}", file=sys.stderr)
+        sys.exit(1)
 
-def compute_summary(df: pd.DataFrame, threshold_after_fee: float) -> dict:
-    if df.empty:
-        return {
-            "records": 0,
-            "pairs_covered": 0,
-            "exchanges_seen": 0,
-            "avg_spread_aud": 0.0,
-            "max_spread_aud": 0.0,
-            "avg_spread_pct": 0.0,
-            "max_spread_pct": 0.0,
-            "opportunities_above_threshold": 0,
-            "top_pairs": [],
-            "top_exchanges": [],
-        }
+    # parse times
+    df["ts_iso"] = pd.to_datetime(df["ts_iso"], errors="coerce", utc=True)
+    # coerce numerics
+    for c in NUMERIC_COLS:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
-    df["spread_aud"] = pd.to_numeric(df["spread_aud"], errors="coerce")
-    df["spread_pct"] = pd.to_numeric(df["spread_pct"], errors="coerce")
-    df["after_fee_spread_pct"] = pd.to_numeric(df["after_fee_spread_pct"], errors="coerce")
-    df["notional_aud"] = pd.to_numeric(df.get("notional_aud", 0.0), errors="coerce")
+    # drop obviously broken rows
+    df = df.dropna(subset=["ts_iso", "symbol", "buy_ex", "sell_ex", "net_spread_bps"])
+    return df
+
+
+def filter_date(df: pd.DataFrame, date=None, start=None, end=None) -> pd.DataFrame:
+    if date:
+        d0 = pd.Timestamp(date).tz_localize("UTC")
+        d1 = d0 + pd.Timedelta(days=1)
+        m = (df["ts_iso"] >= d0) & (df["ts_iso"] < d1)
+        return df.loc[m].copy()
+    if start or end:
+        if start:
+            s0 = pd.Timestamp(start).tz_localize("UTC")
+        else:
+            s0 = df["ts_iso"].min()
+        if end:
+            e1 = pd.Timestamp(end).tz_localize("UTC") + pd.Timedelta(days=1)
+        else:
+            e1 = df["ts_iso"].max() + pd.Timedelta(seconds=1)
+        m = (df["ts_iso"] >= s0) & (df["ts_iso"] < e1)
+        return df.loc[m].copy()
+    # default: today UTC
+    today = pd.Timestamp.utcnow().normalize().tz_localize("UTC")
+    tomorrow = today + pd.Timedelta(days=1)
+    m = (df["ts_iso"] >= today) & (df["ts_iso"] < tomorrow)
+    return df.loc[m].copy()
+
+
+def summarize(df: pd.DataFrame) -> dict:
+    total = len(df)
+    opps = int((df["meets_threshold"] == 1).sum())
+    opp_rate = (opps / total * 100.0) if total else 0.0
+
+    avg_gross = df["gross_spread_bps"].mean() if total else np.nan
+    avg_net = df["net_spread_bps"].mean() if total else np.nan
+    med_net = df["net_spread_bps"].median() if total else np.nan
+    max_row = df.loc[df["net_spread_bps"].idxmax()] if total else None
+
+    # top symbols by opp count (meets=1)
+    df_meets = df[df["meets_threshold"] == 1]
+    top_pairs = (
+        df_meets.groupby("symbol", as_index=False)
+        .size()
+        .sort_values("size", ascending=False)
+    )
+
+    # top symbols by mean net bps (min 3 events)
+    top_pairs_by_net = (
+        df_meets.groupby("symbol", as_index=False)["net_spread_bps"]
+        .agg(["count", "mean", "median", "max"])
+        .reset_index()
+        .rename(columns={"count": "events", "mean": "mean_net_bps", "median": "median_net_bps", "max": "max_net_bps"})
+        .query("events >= 3")
+        .sort_values("mean_net_bps", ascending=False)
+    )
+
+    # top routes (buy_ex -> sell_ex) by opp frequency
+    if not df_meets.empty:
+        df_meets["route"] = df_meets["buy_ex"] + "→" + df_meets["sell_ex"]
+        top_routes = (
+            df_meets.groupby("route", as_index=False)
+            .size()
+            .sort_values("size", ascending=False)
+        )
+    else:
+        top_routes = pd.DataFrame(columns=["route", "size"])
 
     summary = {
-        "records": len(df),
-        "pairs_covered": df["pair"].nunique() if "pair" in df else 0,
-        "exchanges_seen": pd.unique(df[["exchange_buy", "exchange_sell"]].values.ravel("K")).size
-                           if {"exchange_buy","exchange_sell"}.issubset(df.columns) else 0,
-        "avg_spread_aud": float(df["spread_aud"].mean(skipna=True) or 0.0),
-        "max_spread_aud": float(df["spread_aud"].max(skipna=True) or 0.0),
-        "avg_spread_pct": float(df["spread_pct"].mean(skipna=True) or 0.0),
-        "max_spread_pct": float(df["spread_pct"].max(skipna=True) or 0.0),
-        "opportunities_above_threshold": int((df["after_fee_spread_pct"] > threshold_after_fee).sum()),
+        "total_rows": total,
+        "opportunities": opps,
+        "opportunity_rate_pct": round(opp_rate, 2),
+        "avg_gross_bps": None if pd.isna(avg_gross) else round(float(avg_gross), 2),
+        "avg_net_bps": None if pd.isna(avg_net) else round(float(avg_net), 2),
+        "median_net_bps": None if pd.isna(med_net) else round(float(med_net), 2),
+        "max_net_row": max_row.to_dict() if max_row is not None else {},
+        "top_pairs_by_count": top_pairs,
+        "top_pairs_by_mean_net": top_pairs_by_net,
+        "top_routes_by_count": top_routes,
     }
-
-    # Top pairs by count above threshold
-    if {"pair", "after_fee_spread_pct"}.issubset(df.columns):
-        top_pairs = (
-            df[df["after_fee_spread_pct"] > threshold_after_fee]
-            .groupby("pair")
-            .size()
-            .sort_values(ascending=False)
-            .head(10)
-        )
-        summary["top_pairs"] = list(top_pairs.items())
-
-    # Top exchange routes (buy->sell)
-    if {"exchange_buy", "exchange_sell", "after_fee_spread_pct"}.issubset(df.columns):
-        routes = (
-            df[df["after_fee_spread_pct"] > threshold_after_fee]
-            .assign(route=df["exchange_buy"].astype(str) + "→" + df["exchange_sell"].astype(str))
-            .groupby("route")
-            .size()
-            .sort_values(ascending=False)
-            .head(10)
-        )
-        summary["top_exchanges"] = list(routes.items())
-
     return summary
 
-def write_summary_txt(path: str, target_date: str, tz_label: str, threshold: float, summary: dict):
-    with open(path, "w") as f:
-        f.write(f"Detection Summary for {target_date} ({tz_label})\n")
-        f.write("=" * 48 + "\n\n")
-        f.write(f"Records captured: {summary['records']}\n")
-        f.write(f"Pairs covered: {summary['pairs_covered']}\n")
-        f.write(f"Distinct exchanges seen: {summary['exchanges_seen']}\n\n")
-        f.write(f"Average spread: {summary['avg_spread_aud']:.2f} AUD ({summary['avg_spread_pct']:.3f}%)\n")
-        f.write(f"Max spread: {summary['max_spread_aud']:.2f} AUD ({summary['max_spread_pct']:.3f}%)\n")
-        f.write(f"Opportunities above {threshold:.2f}% after fees: {summary['opportunities_above_threshold']}\n\n")
 
-        if summary.get("top_pairs"):
-            f.write("Top pairs by count above threshold:\n")
-            for pair, cnt in summary["top_pairs"]:
-                f.write(f"  - {pair}: {cnt}\n")
-            f.write("\n")
+def write_summary_csv(summary: dict, out_csv: Path, topn: int):
+    rows = []
+    rows.append({"metric": "total_rows", "value": summary["total_rows"]})
+    rows.append({"metric": "opportunities", "value": summary["opportunities"]})
+    rows.append({"metric": "opportunity_rate_pct", "value": summary["opportunity_rate_pct"]})
+    rows.append({"metric": "avg_gross_bps", "value": summary["avg_gross_bps"]})
+    rows.append({"metric": "avg_net_bps", "value": summary["avg_net_bps"]})
+    rows.append({"metric": "median_net_bps", "value": summary["median_net_bps"]})
 
-        if summary.get("top_exchanges"):
-            f.write("Top exchange routes (buy→sell) above threshold:\n")
-            for route, cnt in summary["top_exchanges"]:
-                f.write(f"  - {route}: {cnt}\n")
+    # flatten max row key bits
+    max_row = summary.get("max_net_row", {}) or {}
+    for k in ("ts_iso","symbol","buy_ex","sell_ex","net_spread_bps","gross_spread_bps","fees_bps"):
+        if k in max_row:
+            rows.append({"metric": f"max_net_{k}", "value": max_row[k]})
 
-def plot_spread_over_time(df: pd.DataFrame, out_png: str):
+    # Top lists
+    tp = summary["top_pairs_by_count"].head(topn).copy()
+    tp["metric"] = "top_pair_by_count"
+    tp.rename(columns={"symbol": "key", "size": "value"}, inplace=True)
+    rows += tp[["metric", "key", "value"]].to_dict(orient="records")
+
+    tpn = summary["top_pairs_by_mean_net"].head(topn).copy()
+    tpn["metric"] = "top_pair_by_mean_net"
+    tpn.rename(columns={"symbol": "key", "mean_net_bps": "value"}, inplace=True)
+    rows += tpn[["metric", "key", "value"]].to_dict(orient="records")
+
+    tr = summary["top_routes_by_count"].head(topn).copy()
+    tr["metric"] = "top_route_by_count"
+    tr.rename(columns={"route": "key", "size": "value"}, inplace=True)
+    rows += tr[["metric", "key", "value"]].to_dict(orient="records")
+
+    pd.DataFrame(rows).to_csv(out_csv, index=False)
+
+
+def plot_timeseries(df: pd.DataFrame, out_png: Path, resample="1min"):
     if df.empty:
-        # create an empty placeholder chart
-        plt.figure(figsize=(11,5))
-        plt.title("Spread Over Time (no data)")
-        plt.xlabel("Time (UTC)")
-        plt.ylabel("Spread (AUD)")
-        plt.tight_layout()
-        plt.savefig(out_png)
-        plt.close()
         return
-
-    plt.figure(figsize=(11,5))
-    # plot absolute spread; use a light marker density
-    plt.plot(df["timestamp"], df["spread_aud"], marker=".", linestyle="-", alpha=0.5)
-    plt.title("Spread Over Time (absolute AUD)")
+    ts = df.copy()
+    ts = ts.set_index("ts_iso").sort_index()
+    # minute average across all symbols; you can adjust to show only meets=1 or a specific symbol
+    agg = ts["net_spread_bps"].resample(resample).mean()
+    if agg.dropna().empty:
+        return
+    plt.figure(figsize=(10, 4))
+    agg.plot()  # no explicit color/style
+    plt.title(f"Average Net Spread ({resample})")
     plt.xlabel("Time (UTC)")
-    plt.ylabel("Spread (AUD)")
+    plt.ylabel("Net Spread (bps)")
     plt.tight_layout()
     plt.savefig(out_png)
     plt.close()
 
-def plot_top_pairs_bar(df: pd.DataFrame, threshold_after_fee: float, out_png: str):
-    filt = df[df["after_fee_spread_pct"] > threshold_after_fee]
-    if filt.empty or "pair" not in filt.columns:
-        # placeholder
-        plt.figure(figsize=(10,5))
-        plt.title("Top Pairs Above Threshold (no data)")
-        plt.tight_layout()
-        plt.savefig(out_png)
-        plt.close()
-        return
 
-    counts = filt.groupby("pair").size().sort_values(ascending=False).head(10)
-    plt.figure(figsize=(10,5))
-    counts.plot(kind="bar")
-    plt.title(f"Top Pairs by Count (> {threshold_after_fee:.2f}% after-fee)")
+def plot_histogram(df_meets: pd.DataFrame, out_png: Path):
+    if df_meets.empty:
+        return
+    plt.figure(figsize=(8, 4))
+    vals = df_meets["net_spread_bps"].dropna().values
+    if len(vals) == 0:
+        return
+    plt.hist(vals, bins=40)
+    plt.title("Net Spread Distribution (meets_threshold=1)")
+    plt.xlabel("Net Spread (bps)")
     plt.ylabel("Count")
     plt.tight_layout()
     plt.savefig(out_png)
     plt.close()
 
+
+def plot_top_pairs(df_meets: pd.DataFrame, out_png: Path, topn: int):
+    if df_meets.empty:
+        return
+    counts = (
+        df_meets.groupby("symbol", as_index=False)
+        .size()
+        .sort_values("size", ascending=False)
+        .head(topn)
+    )
+    if counts.empty:
+        return
+    plt.figure(figsize=(10, 5))
+    plt.bar(counts["symbol"], counts["size"])
+    plt.title(f"Top {topn} Pairs by Opportunity Count (meets_threshold=1)")
+    plt.xlabel("Symbol")
+    plt.ylabel("Count")
+    plt.xticks(rotation=45, ha="right")
+    plt.tight_layout()
+    plt.savefig(out_png)
+    plt.close()
+
+
 def main():
     args = parse_args()
-    os.makedirs(args.out_dir, exist_ok=True)
+    csv_path = Path(args.csv).resolve()
+    outdir = Path(args.outdir).resolve()
+    outdir.mkdir(parents=True, exist_ok=True)
 
-    # Determine date (UTC)
+    df = load_df(csv_path)
+    df_day = filter_date(df, date=args.date, start=args.start, end=args.end)
+
+    if df_day.empty:
+        print("No rows matched the selected date/range. Nothing to summarize.")
+        return
+
+    # build file tag (date or range)
     if args.date:
-        try:
-            target = datetime.strptime(args.date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        except ValueError:
-            print("Invalid --date format, use YYYY-MM-DD", file=sys.stderr)
-            sys.exit(2)
+        tag = args.date
+    elif args.start or args.end:
+        tag = f"{args.start or df_day['ts_iso'].min().date()}_to_{args.end or df_day['ts_iso'].max().date()}"
     else:
-        # default to yesterday UTC
-        target = (datetime.now(timezone.utc) - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+        tag = str(pd.Timestamp.utcnow().date())
 
-    # Load + filter
-    df = load_and_filter(args.csv, target)
+    # summary
+    summary = summarize(df_day)
+    out_csv = outdir / f"summary_{tag}.csv"
+    write_summary_csv(summary, out_csv, args.topn)
 
-    # Write daily clean CSV
-    daily_csv = os.path.join(args.out_dir, "daily_clean.csv")
-    cols = [
-        "timestamp_iso","exchange_buy","exchange_sell","pair",
-        "best_ask_buy_ex","best_bid_sell_ex","spread_aud","spread_pct",
-        "after_fee_spread_pct","notional_aud","confidence","reason"
-    ]
-    existing_cols = [c for c in cols if c in df.columns]
-    df[existing_cols].to_csv(daily_csv, index=False)
+    # plots
+    ts_png = outdir / f"plot_timeseries_{tag}.png"
+    plot_timeseries(df_day, ts_png, resample=args.resample)
 
-    # Stats + summary
-    summary = compute_summary(df, args.threshold_after_fee)
-    summary_txt = os.path.join(args.out_dir, "summary_stats.txt")
-    label_date = target.strftime("%Y-%m-%d")
-    write_summary_txt(summary_txt, label_date, args.timezone, args.threshold_after_fee, summary)
+    meets = df_day[df_day["meets_threshold"] == 1]
+    hist_png = outdir / f"plot_hist_{tag}.png"
+    plot_histogram(meets, hist_png)
 
-    # Plots
-    # Ensure sorted by time for plotting
-    df_sorted = df.sort_values("timestamp")
-    spread_png = os.path.join(args.out_dir, "spread_over_time.png")
-    plot_spread_over_time(df_sorted, spread_png)
+    top_png = outdir / f"plot_top_pairs_{tag}.png"
+    plot_top_pairs(meets, top_png, args.topn)
 
-    top_pairs_png = os.path.join(args.out_dir, "top_pairs_bar.png")
-    plot_top_pairs_bar(df_sorted, args.threshold_after_fee, top_pairs_png)
+    print(f"✅ Wrote summary: {out_csv}")
+    if ts_png.exists(): print(f"🖼  Timeseries: {ts_png}")
+    if hist_png.exists(): print(f"🖼  Histogram:  {hist_png}")
+    if top_png.exists(): print(f"🖼  Top pairs:  {top_png}")
 
-    # ZIP bundle
-    zip_name = f"aud_arb_daily_{label_date}.zip"
-    zip_path = os.path.join(args.out_dir, zip_name)
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        z.write(daily_csv, arcname="daily_clean.csv")
-        z.write(spread_png, arcname="spread_over_time.png")
-        z.write(top_pairs_png, arcname="top_pairs_bar.png")
-        z.write(summary_txt, arcname="summary_stats.txt")
-
-    print(f"[OK] Daily report written: {zip_path}")
 
 if __name__ == "__main__":
     main()
