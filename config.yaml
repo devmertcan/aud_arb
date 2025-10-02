@@ -1,12 +1,12 @@
 # detection parameters (tweak anytime)
 max_trade_aud: 250
-min_profit_bps: 70         # 0.70% after fees/slippage
-slippage_bps: 10           # cushion for fills
-poll_ms: 500               # REST/Web poll cadence per symbol per exchange (ms)
+min_profit_bps: 50         # 0.50% after fees/slippage
+slippage_bps: 10
+poll_ms: 500
 log_dir: "./logs"
 out_dir: "./out"
 
-# AUD focus
+# AUD focus (+ memes)
 symbols:
   - BTC/AUD
   - ETH/AUD
@@ -20,8 +20,9 @@ symbols:
   - LTC/AUD
   - DOGE/AUD
   - SHIB/AUD
+  - PEPE/AUD
 
-# Exchanges (CCXT + custom swyftx)
+# Exchanges (CCXT + custom swyftx, OKX via WS)
 exchanges:
   - kraken
   - independentreserve
@@ -30,11 +31,11 @@ exchanges:
   - coinspot
   - swyftx
 
-# conservative taker fee assumptions (bps)
+# taker fee assumptions (bps) — edit to match the account's tier
 fees_bps:
-  kraken: 26
-  independentreserve: 50
-  btcmarkets: 35
-  okx: 10
-  coinspot: 100
-  swyftx: 100
+  coinspot: 10           # 0.10%
+  swyftx: 60             # 0.60%
+  kraken: 40             # 0.40%
+  okx: 50                # 0.50% (set 10 if using OKX base taker 0.10%)
+  btcmarkets: 85         # 0.85%
+  independentreserve: 50 # 0.50%

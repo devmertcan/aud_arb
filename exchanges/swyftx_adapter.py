@@ -5,18 +5,14 @@ from typing import Dict, List, Optional
 import aiohttp
 from loguru import logger
 
-SWYFTX_API_BASE = "https://api.swyftx.com.au"   # prod
+SWYFTX_API_BASE = "https://api.swyftx.com.au"
 SWYFTX_API_DEMO = "https://api.demo.swyftx.com.au"
 
 class SwyftxExchangeClient:
-    """
-    Minimal Swyftx reader for TOB price; uses access token (Bearer) or refresh flow.
-    Returns dict: {"bid","ask","bid_qty","ask_qty","ts"} — qty may be None.
-    """
     def __init__(self, symbols: List[str], access_token: str, api_key: str, demo: bool = False, refresh_url: str = ""):
         self.id = "swyftx"
         self.symbols_req = symbols
-        self.symbol_map = set(symbols)  # assume all; API discovery can be added
+        self.symbol_map = set(symbols)
         self.markets_loaded = True
         self.needs_auth = False
 
@@ -26,7 +22,6 @@ class SwyftxExchangeClient:
         self._base = SWYFTX_API_DEMO if demo else SWYFTX_API_BASE
         self._session: Optional[aiohttp.ClientSession] = None
 
-        # diagnostics
         self._last_status = None
         self._last_body = None
         self._last_refresh_status = None
@@ -71,7 +66,6 @@ class SwyftxExchangeClient:
             return None
 
     async def refresh_access_token(self) -> bool:
-        """Refresh via user-provided endpoint that returns {"access_token": "..."}"""
         if not self._refresh_url:
             return False
         await self._ensure_session()
@@ -93,20 +87,12 @@ class SwyftxExchangeClient:
             return False
 
     async def load(self):
-        # sanity check: call a lightweight endpoint, tolerate failures
-        _ = await self._get("/markets/info")  # not strictly required
+        _ = await self._get("/markets/info")
         self.markets_loaded = True
 
     async def fetch_tob(self, symbol: str):
-        """
-        Try an orderbook endpoint if accessible; else use ticker.
-        This returns dict with keys present; sizes may be None.
-        """
-        # Normalize symbol to Swyftx format if needed (e.g., BTC/AUD -> BTCAUD); keep simple:
         base, quote = symbol.split("/")
         market = f"{base}{quote}"
-
-        # Try orderbook first (to get sizes)
         ob = await self._get(f"/markets/{market}/orderbook")
         if ob and isinstance(ob, dict):
             try:
@@ -119,15 +105,12 @@ class SwyftxExchangeClient:
             except Exception:
                 pass
 
-        # Fallback: ticker (no sizes)
         tk = await self._get(f"/markets/{market}/ticker")
         if tk and isinstance(tk, dict):
             try:
-                bid = float(tk.get("bid"))
-                ask = float(tk.get("ask"))
+                bid = float(tk.get("bid")); ask = float(tk.get("ask"))
                 if bid and ask:
                     return {"bid": bid, "ask": ask, "bid_qty": None, "ask_qty": None, "ts": time.time()}
             except Exception:
                 pass
-
         return None

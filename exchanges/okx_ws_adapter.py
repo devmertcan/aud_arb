@@ -24,14 +24,6 @@ def _okx_sign(secret: str, ts: str, method: str, path: str, body: str = "") -> s
 
 
 class OkxWSClient:
-    """
-    OKX WebSocket v5 client for order book:
-      - Channel: 'books5' (default) or 'books-l2-tbt'
-      - Auto-reconnect + re-subscribe
-      - Optional private login
-    Stores: tob[instId] = (bid, bid_sz, ask, ask_sz, ts)
-    """
-
     def __init__(
         self,
         instruments: Iterable[str],
@@ -62,15 +54,9 @@ class OkxWSClient:
         self._reconnect_delay = reconnect_delay
 
         self._stop = asyncio.Event()
-
-        # in-memory best bid/ask + sizes: instId -> tuple
         self.tob: Dict[str, tuple] = {}
-
-        # tasks
         self._task_pub_main: Optional[asyncio.Task] = None
         self._task_priv_main: Optional[asyncio.Task] = None
-
-        # diagnostics
         self._first_tick_logged: set[str] = set()
 
     async def start(self):
@@ -176,7 +162,6 @@ class OkxWSClient:
                     asks = entry.get("asks") or []
                     if not bids or not asks:
                         continue
-                    # OKX entries: [price, size, liquidity?, ...]
                     bid = float(bids[0][0]); bid_sz = float(bids[0][1])
                     ask = float(asks[0][0]); ask_sz = float(asks[0][1])
                     ts = time.time()
@@ -220,13 +205,10 @@ class OkxWSClient:
                 break
             if msg.type != aiohttp.WSMsgType.TEXT:
                 continue
-            # For M2: parse orders/balances if needed
+            # M2: orders/balances parsing if needed
 
 
 class OkxWSExchangeClient:
-    """
-    Thin adapter so the main bot can call .fetch_tob(symbol) and get dicts.
-    """
     def __init__(
         self,
         symbols: Iterable[str],
